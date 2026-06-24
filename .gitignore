@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.tgz
+.DS_Store
+npm-debug.log*
+
+# FFmpeg source tarball cached by the engine build (engine/build-engine.sh)
+.ffmpeg-cache/
+
+# Large demo/test media fixtures — binary and reproducible, not for the repo
+assets/fixture_*
+
+# Throwaway per-run diagnostic sink written by the demo server
+buildlog.jsonl

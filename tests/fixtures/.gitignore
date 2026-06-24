@@ -1,0 +1,8 @@
+# Generated media clips — regenerate with gen_clips.sh (needs ffmpeg with libx265/libx264).
+# Not committed: large, binary, and reproducible.
+*.ts
+*.mkv
+*.mp4
+*.mov
+*.265
+*.264

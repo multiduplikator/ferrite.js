@@ -1,0 +1,54 @@
+MIT License
+
+Copyright (c) 2026 ferrite.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+The MIT license above covers the ferrite.js player: everything under src/, the
+engine glue (engine/ferrite.c, engine/ferrite.h), the build scripts, the tests,
+the demo, and the Emscripten-generated loader assets/ferrite.mjs.
+
+This package ADDITIONALLY vendors a prebuilt, FFmpeg-derived WebAssembly engine,
+assets/ferrite.wasm. That binary is a derivative work of FFmpeg and is therefore
+distributed under the terms of the GNU Lesser General Public License, version
+2.1 or later (LGPL-2.1-or-later) — NOT under the MIT license. The engine is
+built from a purpose-built FFmpeg 8.1.1 decode subset configured WITHOUT
+--enable-gpl and WITHOUT --enable-nonfree (see engine/build-engine.sh for the
+exact configure flags), so it contains no GPL or non-free components; LGPL-2.1
+is the operative license for the engine. The full LGPL-2.1 text is provided at
+engine/COPYING.LGPLv2.1. FFmpeg's own copyright notices live in the FFmpeg
+sources fetched by the build script.
+
+Relinking (LGPL-2.1, Section 6): the engine is statically linked into a single
+.wasm. To honor the user's right to modify the LGPL library and relink, this
+repository ships the complete means to rebuild the engine against a modified
+FFmpeg — the engine C source (engine/ferrite.c, engine/ferrite.h), the
+self-contained build script with the full configure flags
+(engine/build-engine.sh), and the pinned FFmpeg version (engine/ffmpeg-version).
+Running engine/build-engine.sh reproduces the matched assets/ferrite.{mjs,wasm}
+pair. The source repository is available at the project's public home.
+
+Patent notice (independent of the copyright license above): the decoders bundled
+in the engine (HEVC/H.264/MPEG-2 video; AAC/AC-3/E-AC-3/MP2/MP3 audio) implement
+formats that may be covered by patents in some jurisdictions. Copyright
+licensing under LGPL-2.1 does not grant any patent license; evaluating patent
+obligations is the redistributor's responsibility. "FFmpeg" is a trademark of
+Fabrice Bellard, originator of the FFmpeg project.

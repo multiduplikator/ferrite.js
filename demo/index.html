@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ferrite.js demo</title>
+  <style>
+    body { margin: 0; background: #14161a; color: #d4d4d4; font: 14px/1.5 system-ui, sans-serif; }
+    header { padding: 12px 16px; background: #1c1f26; border-bottom: 1px solid #2b2f38; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    h1 { font-size: 15px; margin: 0 12px 0 0; font-weight: 600; }
+    input[type=text] { flex: 1; min-width: 280px; background: #2b2f38; color: #d4d4d4; border: 1px solid #3a3f4a; padding: 8px 10px; border-radius: 4px; }
+    select { background: #2b2f38; color: #d4d4d4; border: 1px solid #3a3f4a; padding: 8px 10px; border-radius: 4px; }
+    button { background: #2f6df0; color: #fff; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: default; }
+    label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+    #wrap { padding: 16px; max-width: 980px; }
+    canvas { width: 100%; background: #000; display: block; border-radius: 6px; }
+    #status { margin-top: 12px; color: #9cdcfe; font: 13px/1.5 ui-monospace, monospace; }
+    #out { margin-top: 10px; padding: 8px 12px; white-space: pre-wrap; color: #6a9955;
+      font: 12px/1.5 ui-monospace, monospace; background: #0f1115; border: 1px solid #2b2f38;
+      border-radius: 4px; min-height: 1.5em; max-height: 220px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ferrite.js</h1>
+    <input id="url" type="text" placeholder="Stream URL (cross-origin auto-proxied); blank = fixture" />
+    <label><input type="checkbox" id="live" checked /> live</label>
+    <select id="fixture">
+      <option value="fixture_synth_1080_h264_50_60s.ts">synth 1080 h264 50</option>
+      <option value="fixture_real_1080_hevc_25_60s.ts">real 1080 hevc 25</option>
+      <option value="fixture_real_1440_8_50_60s.ts">real 1440 hevc 8 50</option>
+      <option value="fixture_real_2160_8_25_60s.ts">real 2160 hevc 8 25</option>
+      <option value="fixture_real_2160_10_50_60s.ts">real 2160 hevc 10 50</option>
+      <option value="fixture_lab_2160_10_50.ts">lab 2160 hevc 10 50</option>
+      <option value="fixture_4k50_hlg.m2ts">real 2160 HLG HDR 50</option>
+    </select>
+    <button id="play">Play</button>
+    <button id="stop" disabled>Stop</button>
+    <button id="bench">Benchmark</button>
+    <button id="leak">Leak-test</button>
+  </header>
+  <div id="wrap">
+    <canvas id="screen" width="1280" height="720"></canvas>
+    <div id="status">idle</div>
+    <pre id="out"></pre>
+  </div>
+
+  <script type="module">
+    // Drives the public ferrite.js facade exactly the way an mpegts.js consumer would, plus the optional
+    // built-in controls/debug overlay from the `ferrite.js/controls` subpath. Provides a Benchmark and a
+    // Leak-test button.
+    import Ferrite, { Events } from '/dist/index.js';
+    import { attachControls } from '/dist/controls.js';
+
+    const $ = (id) => document.getElementById(id);
+    const setStatus = (m) => { $('status').textContent = m; };
+    const out = (line) => { $('out').textContent += line + '\n'; $('out').scrollTop = $('out').scrollHeight; };
+    const clearOut = () => { $('out').textContent = ''; };
+
+    // The standalone demo IS the observability harness → getStats()→/buildlog ~1 Hz while playing
+    // (server-readable telemetry; ?debug=0 silences). decode pthread pool = host-adaptive (hc−2, 2..8).
+    const DEBUG = new URLSearchParams(location.search).get('debug') !== '0';
+    const THREADS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
+    const fixture = () => $('fixture').value;
+
+    let player = null, controls = null, statsTimer = null;
+
+    // Resolve the play target to a URL the worker can fetch: blank → the selected fixture's /faux-live;
+    // a same-origin path → pass through; a cross-origin http(s) URL → bridge through /proxy (COEP).
+    function resolveUrl() {
+      const raw = $('url').value.trim();
+      if (!raw) return `/faux-live?file=assets/${fixture()}`;
+      if (raw.startsWith('/')) return raw;
+      let u; try { u = new URL(raw, location.href); } catch { return raw; }
+      if (u.origin === location.origin) return raw;
+      return '/proxy?url=' + encodeURIComponent(u.href);
+    }
+
+    function teardown() {
+      if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+      if (controls) { controls.destroy(); controls = null; }
+      if (!player) return;
+      // The exact mpegts.js-style teardown sequence — safe + idempotent.
+      player.pause(); player.unload(); player.detachMediaElement(); player.destroy();
+      player = null;
+    }
+    // A hard-reload/navigation never runs Stop, so reap the pthread pool on pagehide (else the decode
+    // Workers orphan + pin their SharedArrayBuffer, starving the next page's decode).
+    window.addEventListener('pagehide', () => { try { teardown(); } catch { /* page going away */ } });
+
+    $('play').onclick = async () => {
+      if (!Ferrite.isSupported()) { setStatus('unsupported: needs WebGL2 + AudioContext + WebAssembly'); return; }
+      const isLive = $('url').value.trim() ? $('live').checked : true; // blank URL → fixture is live-only
+      const url = resolveUrl();
+      teardown();
+
+      // transferControlToOffscreen permanently neuters a canvas, so swap in a fresh clone before attaching.
+      const old = $('screen'); old.replaceWith(old.cloneNode(false));
+      const canvas = $('screen');
+
+      player = Ferrite.createPlayer({ type: 'mpegts', isLive, url },
+        { wasmBaseUrl: '/assets/', threads: 'auto' });
+      player.on(Events.LOG, (m) => out('· ' + m));
+      player.on(Events.MEDIA_INFO, (i) => out(`media: ${i.videoCodec} ${i.width}x${i.height} / ${i.audioCodec}`));
+      player.on(Events.ERROR, (type, details, info) => { console.error('[ferrite] ERROR', type, details, info); setStatus(`error: ${type}/${details}`); out(`✗ ERROR ${type}/${details}`); });
+      player.attachCanvas(canvas);
+      controls = attachControls(player, canvas);
+      player.load();
+      await player.play();
+      $('stop').disabled = false;
+      setStatus(`playing ${isLive ? 'live' : 'vod'} ${url}`);
+
+      if (DEBUG) statsTimer = setInterval(() => {
+        if (!player) return;
+        const s = player.getStats();
+        setStatus(`tier ${s.tier} · ${player.videoWidth}x${player.videoHeight} · decoded ${s.framesPresented} · ${s.decodeFps}fps · clock ${player.currentTime.toFixed(1)}s`);
+        try { fetch('/buildlog', { method: 'POST', body: JSON.stringify({ kind: 'stats', ...s }), keepalive: true }).catch(() => {}); } catch {}
+      }, 1000);
+    };
+
+    $('stop').onclick = () => { teardown(); $('stop').disabled = true; setStatus('stopped'); };
+
+    // ---- Benchmark: decode-only throughput (no present/audio/pacing) via demo/bench-worker.js ----
+    $('bench').onclick = () => {
+      clearOut();
+      const file = `/assets/${fixture()}`;
+      out(`benchmark: ${fixture()} · ${THREADS} threads · spawning worker…`);
+      const w = new Worker('/demo/bench-worker.js', { type: 'module' });
+      w.onmessage = (e) => {
+        const d = e.data;
+        if (d.type === 'log') out('· ' + d.m);
+        else if (d.type === 'err') { out('✗ ' + d.m); w.terminate(); }
+        else if (d.type === 'done') { out(`✓ ${d.w}x${d.h} ${d.bd}-bit · ${d.frames} frames · ${d.ms.toFixed(0)} ms · ${d.fps} fps (decode-only, ${d.threads} threads)`); w.terminate(); }
+      };
+      w.postMessage({ file, threads: THREADS });
+    };
+
+    // ---- Leak-test: N play→stop cycles, each asserting getStats() drains to baseline (real-GPU) ----
+    $('leak').onclick = async () => {
+      const CYCLES = 5, PLAY_MS = 2000, POLL_MS = 150, DEADLINE_MS = 6000;
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+      teardown(); $('stop').disabled = true;
+      clearOut();
+      out(`leak-test: ${CYCLES} cycles · ${fixture()}`);
+      const url = `/faux-live?file=assets/${fixture()}`;
+      let leaks = 0;
+      for (let i = 1; i <= CYCLES; i++) {
+        const old = $('screen'); old.replaceWith(old.cloneNode(false));
+        const canvas = $('screen');
+        const p = Ferrite.createPlayer({ type: 'mpegts', isLive: true, url },
+          { wasmBaseUrl: '/assets/', threads: 'auto' });
+        p.attachCanvas(canvas); p.load(); await p.play();
+        await sleep(PLAY_MS);
+        p.pause(); p.unload(); p.detachMediaElement(); p.destroy();
+        // Poll the facade's own stats until teardown drains (the worker posts its final reaped stats +
+        // the present worker confirms the ring emptied), or give up at the deadline.
+        const deadline = performance.now() + DEADLINE_MS;
+        let residual = 'deadline';
+        for (;;) {
+          await sleep(POLL_MS);
+          const s = p.getStats();
+          if (s.workers === 0 && s.audioContexts === 0 && s.connections === 0 && s.heldFrames === 0 && s.presentQueue === 0) { residual = 'clean'; break; }
+          if (performance.now() >= deadline) { residual = `LEAK workers=${s.workers} audioCtx=${s.audioContexts} conns=${s.connections} held=${s.heldFrames} presentQ=${s.presentQueue}`; leaks++; break; }
+        }
+        out(`  cycle ${i}/${CYCLES}: ${residual}`);
+      }
+      out(leaks === 0 ? '✓ leak-test PASSED — all cycles returned to baseline' : '✗ leak-test FAILED — see LEAK lines above');
+    };
+  </script>
+</body>
+</html>
