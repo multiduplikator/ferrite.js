@@ -7,11 +7,11 @@
   "author": "multiduplikator",
   "repository": {
     "type": "git",
-    "url": "git+https://gitlab.com/multiduplikator/ferrite.js.git"
+    "url": "git+https://github.com/multiduplikator/ferrite.js.git"
   },
-  "homepage": "https://gitlab.com/multiduplikator/ferrite.js#readme",
+  "homepage": "https://github.com/multiduplikator/ferrite.js#readme",
   "bugs": {
-    "url": "https://gitlab.com/multiduplikator/ferrite.js/-/issues"
+    "url": "https://github.com/multiduplikator/ferrite.js/issues"
   },
   "keywords": [
     "mpegts",
