@@ -224,7 +224,8 @@ export function attachControls(
   const rClock = row('clock');
   // --- T2 universal telemetry rows (both tiers; fed by player.getStats()) ---
   const rDecode = row('decode');     // fps + cumulative decoded (+ dropped)
-  const rPresent = row('present');   // present cadence vs the MEASURED display refresh (multi-monitor regime tracker)
+  const rPresent = row('present');   // present cadence: fps + Bresenham hold
+  const rDisplay = row('display');   // the MEASURED display refresh (multi-monitor regime tracker): Hz · vsync ms · resync/s
   const rInflight = row('in-flight'); // present-ring depth / cap — the LEAD iPad-wedge signal
   const rQueue = row('decode q');    // tier-specific backlog: WC VideoDecoder queue / SW credits
   const rIngest = row('ingest');     // network throughput + buffered bytes (network- vs decode-stall)
@@ -232,7 +233,7 @@ export function attachControls(
   const rAudio = row('audio');       // audio-sync state: synced/free · seg-queue · rate · stalls
   dbg.append(
     rIso.row, rTier.row, rFmt.row, rStatus.row, rClock.row,
-    rDecode.row, rPresent.row, rInflight.row, rQueue.row, rIngest.row, rFetch.row, rAudio.row,
+    rDecode.row, rPresent.row, rDisplay.row, rInflight.row, rQueue.row, rIngest.row, rFetch.row, rAudio.row,
   );
 
   shell.append(bar);
@@ -354,14 +355,18 @@ export function attachControls(
     rDecode.val.textContent =
       `${s.decodeFps} fps · ${s.framesPresented}f${s.droppedFrames ? ` · ${s.droppedFrames} drop` : ''}`;
 
-    // present cadence vs the MEASURED display refresh (the multi-monitor regime tracker): displayHz is
-    // non-zero only when the vsync estimator has ADOPTED/latched the real refresh; vsync ms is the
-    // interval driving the Bresenham hold; resync/s should stay ~0 (a refresh change re-acquires cleanly,
-    // not via hard resyncs). On a mixed-refresh rig, dragging the window to a different-Hz monitor flips
-    // displayHz/vsync to the new rate within ~0.2 s.
+    // present cadence: fps + Bresenham hold. The MEASURED display refresh lives in its own `display` row
+    // below so a multi-monitor transition stays legible (and the present row stays narrow).
     rPresent.val.textContent =
-      `${s.presentFps} fps · ${s.displayHz > 0 ? `${Math.round(s.displayHz)}Hz` : '~Hz'} · ` +
-      `${s.vsyncIntervalMs.toFixed(1)}ms · hold ${s.cadenceHoldMean.toFixed(2)}` +
+      `${s.presentFps} fps · hold ${s.cadenceHoldMean.toFixed(2)}`;
+
+    // display refresh — the multi-monitor regime tracker: displayHz is non-zero only when the vsync
+    // estimator has ADOPTED/latched the real refresh (a monitor change re-acquires → ~Hz until it
+    // re-latches); vsync ms is the interval driving the Bresenham hold; resync/s should stay ~0 across a
+    // clean re-acquire. On a mixed-refresh rig, dragging the window to a different-Hz monitor flips
+    // displayHz/vsync to the new rate within ~0.2 s.
+    rDisplay.val.textContent =
+      `${s.displayHz > 0 ? `${Math.round(s.displayHz)}Hz` : '~Hz'} · ${s.vsyncIntervalMs.toFixed(1)}ms` +
       `${s.syncResyncsPerSec > 0 ? ` · ${s.syncResyncsPerSec.toFixed(1)} resync/s` : ''}`;
 
     // in-flight: present-ring depth vs the tier's cap — the lead WebCodecs-wedge signal (on iOS the
