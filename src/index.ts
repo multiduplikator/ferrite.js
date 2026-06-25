@@ -31,7 +31,7 @@ import { currentPlatform, type PlatformInfo } from './platform';
 import { PlaybackController, type PlaybackCommand } from './controller/playback';
 import { deriveCapabilities, type SourceCapabilities } from './source/capabilities';
 
-export const version = '1.3.0';
+export const version = '1.3.1';
 
 type Listener = (...args: any[]) => void;
 
