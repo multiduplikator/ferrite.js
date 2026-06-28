@@ -77,9 +77,15 @@ const CSS = `
 .ferrite-spacer { flex: 1 1 auto; }
 .ferrite-live { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; letter-spacing: .06em; color: #ff5252; }
 .ferrite-live-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff5252; }
-.ferrite-controls select.ferrite-deint {
+.ferrite-controls select.ferrite-deint, .ferrite-controls select.ferrite-dyna {
   height: 28px; border: 0; border-radius: 4px; padding: 0 6px;
   background: rgba(255,255,255,.12); color: #fff; font: 12px/1 system-ui, sans-serif; cursor: pointer;
+}
+/* The OPEN dropdown popup renders <option>s with the OS-default (usually white) background; they inherit
+   the select's white text → white-on-white. Set an explicit dark background + light text so the options
+   are readable. (The closed select keeps its translucent-over-video look above.) */
+.ferrite-controls select.ferrite-deint option, .ferrite-controls select.ferrite-dyna option {
+  background: #1c1f26; color: #fff;
 }
 .ferrite-deint-warn { display: none; align-items: center; gap: 4px; font-size: 11px; color: #ffb300; white-space: nowrap; }
 .ferrite-deint-warn.visible { display: inline-flex; }
@@ -182,6 +188,18 @@ export function attachControls(
     deint.appendChild(o);
   }
   deint.value = '1'; // auto — mirrors the decode worker's deintMode default
+  // Audio-dynamics ("Dyna") select (Line/RF/Night → setDrc 0/1/2). Always shown (audio is always
+  // software-decoded → both tiers); harmless on a no-audio source. Night = the engine's universal
+  // feed-forward compressor (codec-independent, both tiers); RF = AC-3/E-AC-3 heavy/RF compression.
+  const dyna = document.createElement('select');
+  dyna.className = 'ferrite-dyna';
+  dyna.title = 'Audio dynamics';
+  for (const [val, label] of [['0', 'Dyna: Line'], ['1', 'Dyna: RF'], ['2', 'Dyna: Night']] as const) {
+    const o = document.createElement('option');
+    o.value = val; o.textContent = label;
+    dyna.appendChild(o);
+  }
+  dyna.value = '0'; // line — mirrors the decode worker's drcMode default (full dynamics)
   const deintWarn = document.createElement('span');
   deintWarn.className = 'ferrite-deint-warn';
   deintWarn.textContent = '⚠ deint n/a';
@@ -202,7 +220,7 @@ export function attachControls(
   live.innerHTML = '<span class="ferrite-live-dot"></span>LIVE';
   const btnFs = document.createElement('button');
   btnFs.title = 'Fullscreen';
-  bar.append(btnPlay, btnMute, vol, deint, deintWarn, seek, time, spacer, live, btnFs);
+  bar.append(btnPlay, btnMute, vol, dyna, deint, deintWarn, seek, time, spacer, live, btnFs);
 
   // ---- debug overlay (long-press) -----------------------------------------------------------
   const dbg = document.createElement('div');
@@ -265,6 +283,7 @@ export function attachControls(
     else void shell.requestFullscreen().catch(() => {});
   };
   deint.onchange = () => { player.setDeint(parseInt(deint.value, 10) || 0); };
+  dyna.onchange = () => { player.setDrc(parseInt(dyna.value, 10) || 0); };
 
   // ---- VOD scrub: drag = live preview (seek per input, worker coalesces); position synced when idle --
   let scrubbing = false;

@@ -12,9 +12,8 @@
 //   - DOM-free / Node-API-free. This module runs UNCHANGED in a browser realm and headless node, so the
 //     leak gate is the same instrument in both tiers. Sinks that need fs/Worker live in the harnesses.
 //
-// SCOPE: this is measurement scaffolding against the CURRENT decode path — it does NOT build the
-// new controller and does NOT touch the decode/present hot loops. Counters with no source yet (no live
-// ingest exists) are reported as 0 and listed as STUBBED in the harnesses + the report.
+// It does NOT touch the decode/present hot loops (counters are plain integer increments; the aggregator is
+// the only thing that builds a record). A counter with no live source on a given path is reported as 0.
 
 /** The counters. Every value is a plain number; the aggregator snapshots them. */
 export interface StatsCounters {

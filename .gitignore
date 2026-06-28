@@ -8,8 +8,10 @@ npm-debug.log*
 # FFmpeg source tarball cached by the engine build (engine/build-engine.sh)
 .ffmpeg-cache/
 
-# Large demo/test media fixtures — binary and reproducible, not for the repo
+# Large demo/test media fixtures — binary and reproducible, not for the repo. The generators
+# (demo/gen_matrix.sh, tests/fixtures/gen_*.sh) are committed as the self-contained source of truth.
 assets/fixture_*
+assets/cap_*
 
 # Throwaway per-run diagnostic sink written by the demo server
 buildlog.jsonl

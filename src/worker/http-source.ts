@@ -471,7 +471,7 @@ export class HttpSource {
       // `this.buf` in place (copyWithin), which would shift the bytes UNDER a returned view before the C
       // bridge copies them out (the bridge reads `out` AFTER this read()'s Promise resolves). A copy taken
       // BEFORE any mutation is the only thing that stays correct. The copy is ≤ the AVIO read (≤256 KiB) —
-      // negligible, and the bridge copies into the wasm heap regardless. (Adversarial review HIGH #1.)
+      // negligible, and the bridge copies into the wasm heap regardless.
       const out = this.buf.slice(off, off + n);
       this.stats.windowServes++;
 

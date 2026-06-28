@@ -85,9 +85,34 @@ function audioLockClock(mediaUs: number, ptsAnchorUs: number, rawUs: number): [n
 // in the engine's shared heap — released back to the decode worker by token (which unrefs the held frame
 // + grants a credit); a 'vf' frame's VideoFrame is CLOSED (frees the HW output pool). The yuv frame
 // is TRUE ZERO-COPY — the GL upload reads the native-stride/native-bit-depth planes straight from the heap.
+/** Display (DAR-correct) width from a base width × sample aspect (anamorphic). The canvas BACKING is sized
+ *  to this; the texture stays at its source dims, so the GPU sampler stretches non-square pixels. 1:1 /
+ *  unknown SAR returns the base width. (Mirrors gl.ts displayW — the present worker computes the WC tier's
+ *  SAR-applied backing width here and hands it to drawFrame.) */
+function displayW(baseW: number, sarNum: number, sarDen: number): number {
+  if (sarNum > 0 && sarDen > 0 && sarNum !== sarDen) return Math.round(baseW * sarNum / sarDen);
+  return baseW;
+}
+
+/** Re-wrap a hardware VideoFrame so its display dims equal its visible (`w`×`h`) dims — neutralizing a HW
+ *  decoder that stamps a bogus displayWidth/Height/visibleRect (Edge's HEVC path reports a constant 1280×720
+ *  for every frame). texImage2D(VideoFrame) sizes the texture from the frame's display dims, so without this
+ *  the texture is built at the wrong size and mismaps onto the viewport (Chrome reports display == visible, so
+ *  it never needs this). Returns a NEW frame over the SAME underlying media (corrected metadata, NO pixel
+ *  copy) that the caller MUST close after uploading; null if construction fails (caller uploads the original). */
+function rewrapDisplay(frame: VideoFrame, w: number, h: number): VideoFrame | null {
+  try {
+    return new VideoFrame(frame, {
+      visibleRect: { x: 0, y: 0, width: w, height: h },
+      displayWidth: w,
+      displayHeight: h,
+    });
+  } catch { return null; }
+}
+
 type RingFrame =
-  | { kind: 'yuv'; ptsUs: number; w: number; h: number; cw: number; ch: number; bitDepth: number; colorspace: number; colorRange: number; colorTrc: number; token: number; ptrs: [number, number, number]; lns: [number, number, number] }
-  | { kind: 'vf'; ptsUs: number; frame: VideoFrame };
+  | { kind: 'yuv'; ptsUs: number; w: number; h: number; cw: number; ch: number; bitDepth: number; colorspace: number; colorRange: number; colorTrc: number; sarNum: number; sarDen: number; token: number; ptrs: [number, number, number]; lns: [number, number, number] }
+  | { kind: 'vf'; ptsUs: number; frame: VideoFrame; sarNum: number; sarDen: number };
 
 class Presenter {
   private renderer: GlRenderer;
@@ -270,7 +295,7 @@ class Presenter {
     if (m.contentPeriodUs > 0) this.decodeContentPeriodUs = m.contentPeriodUs; // TRUE (non-ref-skip-independent) period for the cap
     this.demuxRingBytes = m.demuxRingBytes; // the demux-ring latency signal the degrade trigger runs on
     this.feedContentPeriod(m.ptsUs);
-    const frame: RingFrame = { kind: 'yuv', ptsUs: m.ptsUs, w: m.w, h: m.h, cw: m.cw, ch: m.ch, bitDepth: m.bitDepth, colorspace: m.colorspace, colorRange: m.colorRange, colorTrc: m.colorTrc, token: m.token, ptrs: m.ptrs, lns: m.lns };
+    const frame: RingFrame = { kind: 'yuv', ptsUs: m.ptsUs, w: m.w, h: m.h, cw: m.cw, ch: m.ch, bitDepth: m.bitDepth, colorspace: m.colorspace, colorRange: m.colorRange, colorTrc: m.colorTrc, sarNum: m.sarNum, sarDen: m.sarDen, token: m.token, ptrs: m.ptrs, lns: m.lns };
     if (this.ring.length < this.swRingCap) {
       this.ring.push(frame);
     } else if (!this.paused) {
@@ -291,7 +316,7 @@ class Presenter {
     if (m.contentPeriodUs > 0) this.decodeContentPeriodUs = m.contentPeriodUs; // TRUE (non-ref-skip-independent) period for the cap
     this.demuxRingBytes = m.demuxRingBytes; // the demux-ring latency signal the degrade trigger runs on
     this.feedContentPeriod(m.ptsUs);
-    const frame: RingFrame = { kind: 'vf', ptsUs: m.ptsUs, frame: m.frame };
+    const frame: RingFrame = { kind: 'vf', ptsUs: m.ptsUs, frame: m.frame, sarNum: m.sarNum, sarDen: m.sarDen };
     if (this.ring.length < this.wcRingCap) {
       this.ring.push(frame);
     } else if (!this.paused) {
@@ -389,9 +414,9 @@ class Presenter {
     // from holding integer vsyncs against a wrong nominal interval). The estimator latches once adopted,
     // so this flips true ~once and stays.
     this.vsTick = this.vsync.read(); // ONE snapshot per tick (seedHold + the telemetry post reuse it)
-    // Step 2 (this dispatch): RE-ENABLED. The freeze the cadence reintroduced was the GAPPED ring — decode
-    // dropped frames at the live edge, punching PTS holes the cadence stranded on. That root cause is fixed
-    // (worker.ts no-drop, 458c2e4): the ring is now CONTIGUOUS, so the Bresenham cadence works as designed.
+    // The Bresenham display cadence runs on the CONTIGUOUS present ring. (An earlier gapped ring — decode
+    // dropping frames at the live edge, punching PTS holes the cadence stranded on — was the cause of a
+    // reintroduced freeze; it is fixed by the no-drop credit coupling in worker.ts, so the cadence works as designed.)
     // Engages once the real refresh is measured-stable (mpv gates display-resample on vsync confidence the
     // same way); until adopted the proven audio-timed retire-by-pts path runs, so the warmup is unchanged.
     const cadenceMode = this.vsTick.adopted;
@@ -610,18 +635,49 @@ class Presenter {
         const y = new Uint16Array(buf, f.ptrs[0], yRow * f.h);
         const u = new Uint16Array(buf, f.ptrs[1], uRow * f.ch);
         const v = new Uint16Array(buf, f.ptrs[2], vRow * f.ch);
-        this.renderer.draw(y, yRow, u, uRow, v, vRow, f.w, f.h, f.cw, f.ch, f.bitDepth, f.colorspace, f.colorRange, f.colorTrc);
+        this.renderer.draw(y, yRow, u, uRow, v, vRow, f.w, f.h, f.cw, f.ch, f.bitDepth, f.colorspace, f.colorRange, f.colorTrc, f.sarNum, f.sarDen);
       } else {
         const y = new Uint8Array(buf, f.ptrs[0], yRow * f.h);
         const u = new Uint8Array(buf, f.ptrs[1], uRow * f.ch);
         const v = new Uint8Array(buf, f.ptrs[2], vRow * f.ch);
-        this.renderer.draw(y, yRow, u, uRow, v, vRow, f.w, f.h, f.cw, f.ch, f.bitDepth, f.colorspace, f.colorRange, f.colorTrc);
+        this.renderer.draw(y, yRow, u, uRow, v, vRow, f.w, f.h, f.cw, f.ch, f.bitDepth, f.colorspace, f.colorRange, f.colorTrc, f.sarNum, f.sarDen);
       }
     } else {
-      // WC dims → main (the demuxer reports WC dims as 0; videoWidth/Height + format readout need these).
-      const w = f.frame.displayWidth, h = f.frame.displayHeight;
-      if (w !== this.vfW || h !== this.vfH) { this.vfW = w; this.vfH = h; post({ type: 'vdims', w, h }); }
-      this.renderer.drawFrame(f.frame);
+      // WC GEOMETRY: BROWSER-PRIMARY, CODED-VERIFIED. The caller owns the VideoFrame; it is closed on RETIRE,
+      // not here. texImage2D(VideoFrame) sizes the GL texture from the frame's DISPLAY dims. An honest browser
+      // reports them correctly (conformance-cropped, container-aware) → we trust them and do nothing (no
+      // per-frame alloc). A broken HW decoder can lie about display/visibleRect (Edge's HEVC path stamps a
+      // constant bogus 1280×720), but it still reports codedWidth/Height correctly — so the frame's OWN coded
+      // buffer is a fresh, per-frame ground truth (no caching → no staleness across a mid-stream resolution change).
+      //
+      // Detect the lie on the SAR-IMMUNE HEIGHT axis ONLY: a real conformance crop is < 1 coding-tree-unit
+      // (≤63px; HEVC CTU 64, H.264 MB 16), so a height disagreement > 64px is structurally impossible for a crop
+      // → the decoder is lying. Width is deliberately NOT compared — it's SAR-ambiguous (some browsers pre-apply
+      // SAR to displayWidth, some report square-pixel), and the backing width is codedW × SAR regardless, so the
+      // texture maps onto it correctly either way (the quad samples 0..1). Override = size off coded + re-wrap
+      // the upload to coded; else keep the browser's true cropped height (e.g. 1080, not the padded coded 1088).
+      const MAX_CONFORMANCE_CROP = 64; // 1 CTU — the structural ceiling on a legitimate crop, NOT a tuned threshold.
+      const codedW = f.frame.codedWidth, codedH = f.frame.codedHeight;
+      const bh = f.frame.displayHeight;
+      const lying = bh === 0 || Math.abs(codedH - bh) > MAX_CONFORMANCE_CROP;
+      const dispH = lying ? codedH : bh;
+      // Vdims carries the SQUARE-PIXEL width (main's videoWidth getter applies SAR); the GL backing applies SAR
+      // itself via displayW. Both resolve to the same on-screen display width.
+      if (codedW !== this.vfW || dispH !== this.vfH) {
+        this.vfW = codedW; this.vfH = dispH;
+        post({ type: 'vdims', w: codedW, h: dispH });
+        // One-shot breadcrumb (per dims change) only when overriding a lying decoder — silent on honest browsers.
+        if (lying && DEBUG) post({ type: 'plog', m: `[wc] HW display height ${bh} != coded ${codedH} → override+re-wrap (coded ${codedW}x${codedH})` });
+      }
+      // Re-wrap ONLY when overriding a lying decoder, so texImage2D uploads the full coded frame instead of the
+      // bogus display region (a cheap metadata view over the SAME media — no pixel copy). Honest browsers skip
+      // this entirely → no per-frame alloc. LIMITATION (rare, low severity, no fix): if a lying decoder's coded
+      // buffer is padded, the override uploads the padding rows — the true crop is unknowable (visibleRect is
+      // also bogus). Still strictly better than the 1280×720 mismap.
+      const corrected = lying ? rewrapDisplay(f.frame, codedW, codedH) : null;
+      // Backing: SAR-applied display width × the display height.
+      this.renderer.drawFrame(corrected ?? f.frame, displayW(codedW, f.sarNum, f.sarDen), dispH);
+      if (corrected) corrected.close(); // free the temp wrapper; the original stays in the ring for RETIRE
     }
     this.lastDrawnPts = f.ptsUs;
     this.framesDrawn++; // a distinct front frame was drawn → the authoritative present count

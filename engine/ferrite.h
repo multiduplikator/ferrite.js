@@ -41,6 +41,8 @@ int64_t        ferrite_demux_pkt_dts_us(RDDemux*);
 int            ferrite_demux_pkt_is_key(RDDemux*);     // 1 = AV_PKT_FLAG_KEY set (for WebCodecs Key/Delta)
 int            ferrite_demux_v_profile(RDDemux*);      // video codecpar profile (-99 = unknown)
 int            ferrite_demux_v_level(RDDemux*);        // video codecpar level   (-99 = unknown)
+int            ferrite_demux_v_sar_num(RDDemux*);      // pixel aspect (SAR) via one-shot keyframe decode; 1 if square/unknown
+int            ferrite_demux_v_sar_den(RDDemux*);      // — all-codec (the WebCodecs tier has no FFmpeg decoder to read it off)
 const uint8_t* ferrite_demux_v_extradata(RDDemux*);    // resolved video param sets (Annex-B); 0 until captured
 int            ferrite_demux_v_extradata_size(RDDemux*); // extradata byte count; 0 until captured
 void           ferrite_demux_reset_v_extradata(RDDemux*); // re-arm capture on a mid-stream codec change
@@ -51,10 +53,14 @@ RDAudio*       ferrite_audio_new(int codec_id);
 RDAudio*       ferrite_audio_new_from_demux(RDDemux*);  // VOD/file: copies codecpar extradata (raw AAC ASC etc.)
 int            ferrite_audio_push(RDAudio*, const uint8_t* pkt, uint32_t len, int64_t pts_us); // pkt=NULL/len=0 => EOF drain. 1=ok,0=again,-1=err
 int            ferrite_audio_step(RDAudio*);           // 1 = frame ready, 0 = need-more, -1 = drained/error
+int            ferrite_audio_flush(RDAudio*);          // EOF: drain swr delay line. 1 = final chunk ready, 0 = none
 const float*   ferrite_audio_interleaved(RDAudio*);    // samples*channels floats, valid until next step
 uint32_t       ferrite_audio_samples(RDAudio*);        // per-channel sample count
-uint32_t       ferrite_audio_rate(RDAudio*);
-uint32_t       ferrite_audio_channels(RDAudio*);
+uint32_t       ferrite_audio_rate(RDAudio*);           // OUTPUT rate (after resample to the requested out-rate)
+uint32_t       ferrite_audio_channels(RDAudio*);       // OUTPUT channels after engine stereo downmix (= 2)
+uint32_t       ferrite_audio_src_channels(RDAudio*);   // decoded/source channels pre-downmix (telemetry)
+void           ferrite_audio_set_out_rate(RDAudio*, int rate); // 0 = passthrough; engine resamples to it
+void           ferrite_audio_set_drc(RDAudio*, int mode);      // Dyna: 0=line 1=RF/heavy 2=night (universal compressor)
 int64_t        ferrite_audio_pts_us(RDAudio*);
 void           ferrite_audio_free(RDAudio*);
 

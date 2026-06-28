@@ -31,7 +31,7 @@ import { currentPlatform, type PlatformInfo } from './platform';
 import { PlaybackController, type PlaybackCommand } from './controller/playback';
 import { deriveCapabilities, type SourceCapabilities } from './source/capabilities';
 
-export const version = '1.3.1';
+export const version = '1.3.2';
 
 type Listener = (...args: any[]) => void;
 
@@ -71,6 +71,15 @@ const LIVE_SYNC_STALL_DECAY_CHUNKS = 30;  // ~7-15 s of chunks (~1250 ticks ≈ 
 // + pops a tiny FIFO). Frozen automatically while paused (a suspended AudioContext freezes currentTime).
 const CLOCK_PUBLISH_MS = 10;
 
+// ---- loudness AGC (the reference player's RMS-dBFS → makeup-gain leveller) ----------------------------
+const AGC_TARGET_DB = -18;       // RMS-dBFS target the long-term loudness is nudged toward
+const AGC_MAX_BOOST_DB = 6;      // asymmetric: lift a quiet source by at most +6 dB
+const AGC_MAX_CUT_DB = 9;        // attenuate a hot source by at most −9 dB
+const AGC_LOUDNESS_TAU_S = 12;   // EWMA time constant for the integrated loudness (slow → no pumping)
+const AGC_PEAK_TAU_S = 2;        // decay time constant for the windowed peak (caps the boost vs clipping)
+const AGC_SILENCE_GATE = 1e-7;   // mean-square below this = (near-)silence → hold the loudness estimate
+const AGC_RAMP_TC_S = 0.25;      // setTargetAtTime ramp → smooth gain changes (no zipper noise)
+
 /** Static capability gate (mpegts.isSupported parity). Capability ONLY — NOT crossOriginIsolated:
  *  isolation is a deployment condition, and the contract wants load() to surface an explicit
  *  unsupported-codec ERROR when it's off (degrade-gracefully), not a silent false here. */
@@ -105,7 +114,7 @@ export class FerritePlayer {
   // The caller's DECLARED intent (createPlayer({isLive})) — the PRIMARY input that FEEDS the descriptor
   // (deriveCapabilities) + the worker `load` message. Policy is read from `_caps`, NOT this bool.
   private _isLive: boolean;
-  // LIVE/VOD UNIFICATION (Tier 1): the SINGLE source-policy descriptor. Computed intent-only at construct/
+  // The SINGLE source-policy descriptor (live/VOD). Computed intent-only at construct/
   // load (so the known-path forks behave correctly IMMEDIATELY, before the worker reports), then REFINED
   // when the worker posts `caps` (the first-response headers). Every main-side live/VOD fork reads a field
   // of this — seek()/seekbar/duration (seekable), live-edge catch-up + live-sync (hasLiveEdge), the
@@ -217,11 +226,11 @@ export class FerritePlayer {
   // clock). UNCAPPED + liveSync-independent, unlike liveSyncStalls (which clamps as a target-relax signal).
   private audioUnderruns = 0;       // cumulative audio playout underruns (scheduled audio fell behind ctx.currentTime)
   private audioGapSecs = 0;         // cumulative inserted silence across those underruns (s) — the audible playout gap
-  // Tier-1 Step 1: cumulative audio chunks DROPPED because the scheduled-ahead reservoir was already at
+  // Cumulative audio chunks DROPPED because the scheduled-ahead reservoir was already at
   // the liveSyncMaxLatency cap (the symmetric upper bound to policy.ts's lower-target relax). Caps the
   // reservoir + the in-flight node count so the main thread can't be buried under a growing node queue.
   private audioDrops = 0;
-  // Tier-0 Step 0: publishClock cadence instrument — proves the main-thread stall. The setInterval is
+  // publishClock cadence instrument — detects a main-thread stall. The setInterval is
   // armed for CLOCK_PUBLISH_MS (10ms); a tick GAP ≫ 10ms means main was BLOCKED (couldn't fire the
   // timer) → the SAB clock froze → present starved. Reported ~1/s via Events.LOG → /pumplog.
   private cpLastAt = 0;             // perf.now() of the previous publishClock tick (0 = not yet seen)
@@ -230,6 +239,13 @@ export class FerritePlayer {
   // latency-to-live proxy (s): the scheduled-ahead audio reservoir — exactly the signal the
   // live-sync rate chaser treats as "how far behind the live edge we are." Updated per audio chunk.
   private liveLatencySecs = 0;
+  // ---- loudness AGC state (RMS-dBFS → makeup gain; see playAudio/measureLoudness/applyGain) ----
+  // Levels wildly-varying sources (loud ads vs quiet dialogue) by nudging the LONG-TERM loudness toward
+  // AGC_TARGET_DB via a slow EWMA + a peak-capped, asymmetric makeup gain folded into audioGain alongside
+  // volume/mute. Engine-independent (operates on the delivered PCM) → works on every codec + both tiers.
+  private agcLoudnessMs = 0;   // EWMA of mean-square (linear power); 0 = unseeded
+  private agcPeak = 0;         // decaying windowed peak (linear) — caps the makeup so a boost can't clip
+  private agcMakeup = 1;       // current makeup multiplier (linear), composed into the gain
 
   constructor(dataSource: MediaDataSource, config?: Partial<FerriteConfig>) {
     this.cfg = mergeConfig(config);
@@ -247,7 +263,7 @@ export class FerritePlayer {
     this.cfg.threads = this.threads;
     this.wcRingCap = wcRingCapForPlatform(this.platform.isIOS, this.cfg.wcPresentRingCap);
     // The live SW path is in-order credit-coupled decode (no-drop → a contiguous present ring → continuous
-    // video; the freerun decouple was retired — its present-side drop-oldest punched PTS holes → freeze-jump
+    // video; a decoupled present-side drop-oldest was tried and rejected — it punched PTS holes → freeze-jump
     // on real streams). The in-flight/credit cap (= the present cushion depth) is the memory bound and is
     // iOS-aware to keep held frames inside the iPad budget under ?flood. ?ring (swPresentRingCap) overrides
     // the depth.
@@ -484,6 +500,7 @@ export class FerritePlayer {
     this.audioCtx = null;
     this.audioGain = null;
     this.audioActive = false;
+    this.agcLoudnessMs = 0; this.agcPeak = 0; this.agcMakeup = 1; // fresh leveller for the next load
     this.clock = null;
     this.clockSab = null;
   }
@@ -802,15 +819,62 @@ export class FerritePlayer {
     this.post({ type: 'setDeint', mode });
   }
 
+  /** Audio dynamics ("Dyna") mode, settable mid-playback: 0 = Line (full dynamics / authored codec DRC),
+   *  1 = RF (AC-3/E-AC-3 heavy/RF compression — small speakers / loud rooms), 2 = Night (the engine's
+   *  universal feed-forward compressor that tames loud peaks for ANY codec on BOTH tiers — late-night
+   *  quiet listening). Drives the DECODE worker's audio decoder (`ferrite_audio_set_drc`, read per-frame).
+   *  No-op after destroy(); silently no-ops against an engine wasm that predates the setter. */
+  setDrc(mode: number): void {
+    if (this.destroyed) return;
+    this.post({ type: 'setDrc', mode });
+  }
+
   get volume(): number { return this._volume; }
   set volume(v: number) {
     this._volume = Math.max(0, Math.min(1, v));
-    if (this.audioGain) this.audioGain.gain.value = this._muted ? 0 : this._volume;
+    this.applyGain();
   }
   get muted(): boolean { return this._muted; }
   set muted(m: boolean) {
     this._muted = m;
-    if (this.audioGain) this.audioGain.gain.value = m ? 0 : this._volume;
+    this.applyGain();
+  }
+
+  /** Fold volume × mute × AGC makeup into the master gain. `ramp` glides over AGC_RAMP_TC_S (the per-chunk
+   *  AGC update, no zipper noise); a user volume/mute change snaps. The makeup defaults to 1 (unity) until
+   *  the AGC has integrated a loudness estimate, so this is a no-op leveller for the first chunks. */
+  private applyGain(ramp = false): void {
+    const g = this.audioGain;
+    if (!g) return;
+    const target = this._muted ? 0 : this._volume * this.agcMakeup;
+    if (ramp && this.audioCtx) g.gain.setTargetAtTime(target, this.audioCtx.currentTime, AGC_RAMP_TC_S);
+    else g.gain.value = target;
+  }
+
+  /** Loudness AGC (the reference player's RMS-dBFS → makeup-gain leveller). Integrates this chunk's
+   *  mean-square into a slow EWMA (≈AGC_LOUDNESS_TAU_S) + a decaying peak (≈AGC_PEAK_TAU_S), then derives a
+   *  peak-capped, asymmetric makeup that nudges the long-term loudness toward AGC_TARGET_DB. Updates
+   *  `agcMakeup`; the caller applies it via applyGain(true). Engine-independent (operates on the delivered
+   *  interleaved PCM) → levels every codec on both tiers. Near-silent chunks hold the estimate. */
+  private measureLoudness(interleaved: Float32Array, channels: number, sampleRate: number): void {
+    const n = interleaved.length;
+    if (n === 0 || sampleRate <= 0 || channels <= 0) return;
+    let sumSq = 0, peak = 0;
+    for (let i = 0; i < n; i++) { const s = interleaved[i]; sumSq += s * s; const a = s < 0 ? -s : s; if (a > peak) peak = a; }
+    const meanSq = sumSq / n;                       // mean power over all samples (channel-agnostic)
+    const chunkSecs = (n / channels) / sampleRate;  // n = frames·channels → frames/rate = chunk duration
+    // Decaying windowed peak (caps the boost so a quiet-but-spiky source can't be lifted into clipping).
+    this.agcPeak = Math.max(peak, this.agcPeak * Math.exp(-chunkSecs / AGC_PEAK_TAU_S));
+    if (meanSq < AGC_SILENCE_GATE) return; // (near-)silence → hold the loudness estimate + last makeup
+    // Slow EWMA of the loudness power (long tau → tracks programme level, not transients).
+    const alpha = Math.min(chunkSecs / AGC_LOUDNESS_TAU_S, 1);
+    this.agcLoudnessMs = this.agcLoudnessMs <= 0 ? meanSq : this.agcLoudnessMs + alpha * (meanSq - this.agcLoudnessMs);
+    const loudnessDb = 10 * Math.log10(this.agcLoudnessMs);
+    // Peak-aware upper bound: never boost beyond what keeps the windowed peak ≤ full scale.
+    const peakCapDb = this.agcPeak > 0 ? -20 * Math.log10(this.agcPeak) : Infinity;
+    const upper = Math.max(-AGC_MAX_CUT_DB, Math.min(AGC_MAX_BOOST_DB, peakCapDb));
+    const makeupDb = Math.max(-AGC_MAX_CUT_DB, Math.min(upper, AGC_TARGET_DB - loudnessDb));
+    this.agcMakeup = Math.pow(10, makeupDb / 20);
   }
 
   // ---- typed event bus (mpegts on/off; listeners receive variadic args) -------
@@ -864,7 +928,7 @@ export class FerritePlayer {
     this.liveSyncLastRate = 1;
     this.liveLatencySecs = 0;
     this._workerStats = null;
-    // Re-seed the Step-0 stall instrument: a new audio epoch (re-attach/seek/resume) must NOT count the
+    // Re-seed the stall instrument: a new audio epoch (re-attach/seek/resume) must NOT count the
     // teardown/seek pause as an inter-tick gap. Zeroing cpLastAt makes the next publishClock tick re-seed
     // the report window instead of measuring a bogus multi-second gap. audioDrops is NOT reset here — like
     // audioUnderruns it is a cumulative cross-epoch health counter.
@@ -884,8 +948,8 @@ export class FerritePlayer {
         this.emit(Events.MEDIA_INFO, this.mediaInfo);
         break;
       case 'caps':
-        // The worker resolved the descriptor from the first response's headers (LIVE/VOD UNIFICATION
-        // Tier 1). REFINE main's intent-only copy so the seek()/duration/seekbar forks key on the observed
+        // The worker resolved the descriptor from the first response's headers.
+        // REFINE main's intent-only copy so the seek()/duration/seekbar forks key on the observed
         // capabilities (e.g. a degraded-200 VOD flips seekable→false → seekbar hides). Re-emit MEDIA_INFO
         // so a controls layer re-renders the scrub-vs-live decision against the refined duration.
         this._caps = msg.caps;
@@ -1020,8 +1084,13 @@ export class FerritePlayer {
     if (this.audioCtx) return;
     this.audioCtx = new AudioContext();
     this.audioGain = this.audioCtx.createGain();
-    this.audioGain.gain.value = this._muted ? 0 : this._volume;
     this.audioGain.connect(this.audioCtx.destination);
+    this.applyGain(); // volume × mute × AGC makeup (makeup starts at unity)
+    // Forward the AudioContext rate to the engine so swresample resamples to it in ONE stateful pass
+    // (the engine then also downmixes surround → stereo), replacing Web Audio's per-AudioBuffer resample
+    // + auto-downmix. Soft no-op against an engine wasm that predates the setter (PCM then arrives at the
+    // decoded rate/layout and Web Audio handles it — the pre-overhaul path).
+    this.post({ type: 'setAudioOutRate', rate: Math.round(this.audioCtx.sampleRate) });
   }
 
   /** Publish the audio playout elapsed into the clock SAB (the present worker's `media_now` source).
@@ -1070,7 +1139,7 @@ export class FerritePlayer {
   // ptsUs is unused: audio scheduling is wall-clock-driven (audioNextStart), not PTS-driven.
   private playAudio(interleaved: Float32Array, channels: number, sampleRate: number, _ptsUs: number): void {
     if (!this.audioCtx || !this.audioGain || this._paused) return;
-    // ---- Tier-1 Step 1: bound the audio reservoir (drop, don't queue) ----
+    // ---- bound the audio reservoir (drop, don't queue) ----
     // The decode-vs-realtime surplus schedules chunks ever-further into the future → the reservoir
     // (scheduledAhead) climbs to ~2.5s, deepening the live AudioBufferSourceNode queue + GC churn that
     // stalls main and starves the clock publisher (the freeze). If the cursor is already past the
@@ -1081,11 +1150,14 @@ export class FerritePlayer {
     const scheduledAhead = this.audioActive ? Math.max(0, this.audioNextStart - this.audioCtx.currentTime) : 0;
     if (this.audioActive && scheduledAhead > this.cfg.liveSyncMaxLatency) {
       this.audioDrops++;
-      this.liveLatencySecs = scheduledAhead; // telemetry only (no clock state) — keeps [clock] ahead=/latencyToLive honest during the drain burst so Step 0 SEES the reservoir pinned at the cap
+      this.liveLatencySecs = scheduledAhead; // telemetry only (no clock state) — keeps the latency-to-live signal honest during the drain burst (the reservoir pinned at the cap)
       return; // before any buffer/source allocation and without advancing the schedule cursor
     }
     const frames = interleaved.length / channels;
     if (frames <= 0) return;
+    // Loudness AGC: integrate this chunk's RMS/peak + glide the makeup gain toward the target level.
+    this.measureLoudness(interleaved, channels, sampleRate);
+    this.applyGain(true);
     const buf = this.audioCtx.createBuffer(channels, frames, sampleRate);
     for (let c = 0; c < channels; c++) {
       const ch = buf.getChannelData(c);
@@ -1094,7 +1166,7 @@ export class FerritePlayer {
     const src = this.audioCtx.createBufferSource();
     src.buffer = buf;
     src.connect(this.audioGain);
-    // Tier-1 Step 2: no per-node `src.onended = () => src.disconnect()`. A finished AudioBufferSourceNode
+    // No per-node `src.onended = () => src.disconnect()`. A finished AudioBufferSourceNode
     // releases its playing-reference and is GC-eligible even while still connected (WebAudio spec), so the
     // closure + disconnect were needless per-chunk churn (a retained closure + a graph mutation per chunk)
     // feeding exactly the GC pressure that stalls main. Let the finished node fall out of scope.

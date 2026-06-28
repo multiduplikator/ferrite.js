@@ -95,7 +95,7 @@ export const defaultConfig: FerriteConfig = {
   wcPresentRingCap: undefined, // platform default (iOS tight / desktop deep)
 
   // SW present/decode coupling is in-order credit-coupled (no-drop → a CONTIGUOUS present ring → continuous
-  // video; the freerun decouple was retired). swPresentRingCap ⇒ the iOS-aware RING_CAP (resolved in the constructor).
+  // video; a decoupled present path was tried and rejected). swPresentRingCap ⇒ the iOS-aware RING_CAP (resolved in the constructor).
   swPresentRingCap: undefined, // ⇒ RING_CAP (12 desktop / 6 iOS), the in-flight memory bound
 
   enableStashBuffer: true,

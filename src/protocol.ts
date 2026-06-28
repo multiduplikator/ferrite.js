@@ -90,6 +90,13 @@ export type MainToWorker =
   // remembers it and re-applies (ferrite_vdec_set_deint) after every (re)create. Software tier only —
   // the WebCodecs/HW tier deinterlaces in hardware.
   | { type: 'setDeint'; mode: number }
+  // Audio dynamics ("Dyna") mode (0=line, 1=RF/heavy, 2=night), settable mid-stream. The worker remembers
+  // it and re-applies (ferrite_audio_set_drc) after every audio-decoder (re)create. Both tiers (audio is
+  // always software-decoded). Night = the engine's universal feed-forward compressor (codec-independent).
+  | { type: 'setDrc'; mode: number }
+  // The AudioContext output sample rate, forwarded from main once audio is set up: the engine resamples
+  // to it in one stateful swresample pass (replacing Web Audio's per-chunk resample). 0 = passthrough.
+  | { type: 'setAudioOutRate'; rate: number }
   | { type: 'destroy' };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +104,7 @@ export type MainToWorker =
 // ---------------------------------------------------------------------------
 export type WorkerToMain =
   | { type: 'ready'; info: WorkerMediaInfo }
-  // The resolved SourceCapabilities descriptor (LIVE/VOD UNIFICATION Tier 1), computed ONCE per load from
+  // The resolved SourceCapabilities descriptor, computed ONCE per load from
   // the declared intent + the FIRST response's headers (no extra round-trip). Drives the main-side
   // live/VOD forks: seek() (seekable), the duration getter/seekbar (seekable), the live-edge catch-up +
   // live-sync (hasLiveEdge). Posted after the first connect (live) / HttpSource.open (VOD).
@@ -160,11 +167,21 @@ export type DecodeToPresent =
   // ring (a brief flash of the prior stream). The present worker DROPS any frame whose gen is older than
   // its current (reset-set) gen — see isStaleLoadGen. The decode loop only posts while it is the current
   // load (alive() ⇒ gen===myGen), and gen is monotonic, so a CURRENT frame can never carry a stale gen.
-  | { type: 'frame'; gen: number; ptsUs: number; w: number; h: number; cw: number; ch: number; bitDepth: number; colorspace: number; colorRange: number; colorTrc: number; token: number; ptrs: [number, number, number]; lns: [number, number, number]; contentPeriodUs: number; demuxRingBytes: number }
+  // `sarNum`/`sarDen` = the single demux-resolved pixel aspect (anamorphic). The present worker sizes the
+  // canvas BACKING to display_w = coded_w × SAR (texture stays at coded dims, the sampler stretches), so a
+  // non-square-pixel stream renders the right shape. Rides each frame (constant per stream; cheap two ints,
+  // same idiom as colorspace) so there is no ordering race with a one-time message. 1:1 = square pixels.
+  | { type: 'frame'; gen: number; ptsUs: number; w: number; h: number; cw: number; ch: number; bitDepth: number; colorspace: number; colorRange: number; colorTrc: number; sarNum: number; sarDen: number; token: number; ptrs: [number, number, number]; lns: [number, number, number]; contentPeriodUs: number; demuxRingBytes: number }
   // One decoded video frame from the WEBCODECS (hardware) tier. The VideoFrame is TRANSFERRED (it is
   // Transferable over a MessagePort) — the present worker OWNS it and MUST `.close()` it once uploaded/
   // evicted, or the decoder's output pool starves. `ptsUs` mirrors the frame's own `.timestamp`.
-  | { type: 'vframe'; gen: number; ptsUs: number; frame: VideoFrame; contentPeriodUs: number; demuxRingBytes: number }
+  // `sarNum`/`sarDen` — the single demux-resolved pixel aspect (see `frame`). The WebCodecs tier has no
+  // FFmpeg decoder to read a frame SAR off, so this engine-resolved value un-squishes anamorphic on the HW
+  // path: the present worker sizes the backing width to codedWidth × SAR (the texture stays at coded dims).
+  // (WebCodecs display GEOMETRY — to neutralize HW decoders, e.g. Edge's HEVC path, that stamp bogus
+  // VideoFrame display/visibleRect dims — is derived present-side from the frame's OWN coded dims, so it
+  // needs no plumbing here.)
+  | { type: 'vframe'; gen: number; ptsUs: number; frame: VideoFrame; sarNum: number; sarDen: number; contentPeriodUs: number; demuxRingBytes: number }
   // codec-change seam safety (iOS only): a LIVE WebCodecs decoder was just freed mid-stream. Any
   // of its VideoFrames still in the present ring are backed (on iOS/VideoToolbox) by the now-freed
   // decoder pool, so the present worker must CLOSE them before a draw could touch a dead pool. `gen`

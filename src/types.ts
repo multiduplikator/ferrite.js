@@ -217,7 +217,7 @@ export interface FerriteStats {
   audioQueue: number; // in-flight scheduled audio segments (segQ depth — the audio FIFO depth)
   audioUnderruns: number; // cumulative audio playout underruns (scheduled audio fell behind → the clock stutters)
   audioGapSecs: number;   // cumulative inserted silence (s) across those underruns — the audible playout gap
-  audioDrops: number;     // cumulative audio chunks dropped at the reservoir cap (Tier-1 reservoir bound)
+  audioDrops: number;     // cumulative audio chunks dropped at the reservoir cap (the reservoir bound)
   speed: number; // current live-sync playback rate (1.0 = no sync nudge)
   liveSyncStalls: number; // audio underruns counted (relaxes the latency target)
   // ---- recovery counters (the single error controller's recovery path; un-stubbed from the bus) ----

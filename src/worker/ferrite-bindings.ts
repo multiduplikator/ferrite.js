@@ -176,6 +176,12 @@ export class Ferrite {
   /** Video profile/level from the demuxer (HEVC carries real values; H.264 leaves them -99 → parse SPS). */
   demuxVProfile(d: number): number { return this.M._ferrite_demux_v_profile(d); }
   demuxVLevel(d: number): number { return this.M._ferrite_demux_v_level(d); }
+  /** Pixel aspect ratio (SAR) resolved by a one-shot keyframe decode in the demuxer — the SINGLE SAR
+   *  source for BOTH tiers (the WebCodecs tier has no FFmpeg decoder to read a frame SAR off, and the
+   *  live mpegts probe never fills codecpar SAR). Returns 0 against an engine wasm that predates the
+   *  getter, so callers fall back (software → its own frame SAR; WebCodecs → 1:1). */
+  demuxVSarNum(d: number): number { return this.M._ferrite_demux_v_sar_num ? this.M._ferrite_demux_v_sar_num(d) : 0; }
+  demuxVSarDen(d: number): number { return this.M._ferrite_demux_v_sar_den ? this.M._ferrite_demux_v_sar_den(d) : 0; }
   /** Resolved video param-set extradata size (Annex-B); 0 until the live demux extracts the in-band
    *  VPS/SPS/PPS (or find_stream_info fills it for VOD). >0 ⇒ build the decoder via vdecNewFromDemux. */
   demuxVExtradataSize(d: number): number { return this.M._ferrite_demux_v_extradata_size(d); }
@@ -264,6 +270,19 @@ export class Ferrite {
   audioSamples(a: number): number { return this.M._ferrite_audio_samples(a); } // per channel
   audioRate(a: number): number { return this.M._ferrite_audio_rate(a); }
   audioChannels(a: number): number { return this.M._ferrite_audio_channels(a); }
+  /** Decoded/source channel count BEFORE the engine stereo downmix (telemetry: shows 5.1 etc.). Falls
+   *  back to the (output) channel count against an engine wasm that predates the getter. */
+  audioSrcChannels(a: number): number { return (this.M._ferrite_audio_src_channels ?? this.M._ferrite_audio_channels)(a); }
+  /** Set the engine's OUTPUT sample rate (the AudioContext rate) so swresample resamples to it in one
+   *  stateful pass. 0 = passthrough. Soft no-op against an engine that predates the setter (the PCM then
+   *  arrives at the decoded rate and Web Audio resamples per-chunk — the pre-overhaul behaviour). */
+  audioSetOutRate(a: number, rate: number): void { this.M._ferrite_audio_set_out_rate?.(a, rate); }
+  /** Set the audio dynamics ("Dyna") mode: 0=line, 1=RF/heavy, 2=night (universal compressor). Soft
+   *  no-op against an engine that predates the setter. */
+  audioSetDrc(a: number, mode: number): void { this.M._ferrite_audio_set_drc?.(a, mode); }
+  /** EOF drain of the swresample delay line (VOD tail). 1 = a final chunk is ready in the interleaved
+   *  buffer, 0 = nothing buffered (or the engine predates the call). */
+  audioFlush(a: number): number { return this.M._ferrite_audio_flush ? this.M._ferrite_audio_flush(a) : 0; }
   audioPtsUs(a: number): bigint { return this.M._ferrite_audio_pts_us(a); }
   /**
    * Copy interleaved float PCM out of the heap into a fresh, transferable buffer.

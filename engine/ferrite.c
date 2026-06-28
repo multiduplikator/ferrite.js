@@ -3,6 +3,7 @@
 #include "ferrite.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>    // expf/powf/fabsf — the Dyna "Night" feed-forward compressor
 #include <stdio.h>   // SEEK_SET / SEEK_CUR / SEEK_END for the file-mode AVIO seek callback
 #include <emscripten.h>   // EM_ASYNC_JS — the AWAITing JS range-read bridge for the streaming VOD AVIO (Asyncify)
 #include <libavformat/avformat.h>
@@ -10,6 +11,7 @@
 #include <libavcodec/bsf.h>          // extract_extradata BSF — live param-set resolution
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/opt.h>           // av_opt_set_double — swresample downmix center-mix-level override
 #include <libavutil/pixdesc.h>
 #include <libavfilter/avfilter.h>
 #include <libavfilter/buffersrc.h>
@@ -463,14 +465,50 @@ int ferrite_demux_pkt_is_key(RDDemux* d) { return (d && d->pkt && (d->pkt->flags
 int ferrite_demux_v_profile(RDDemux* d) { return (d && d->vstream >= 0) ? d->fmt->streams[d->vstream]->codecpar->profile : -99; }
 int ferrite_demux_v_level(RDDemux* d)   { return (d && d->vstream >= 0) ? d->fmt->streams[d->vstream]->codecpar->level   : -99; }
 
+// Sample aspect ratio (pixel shape) for the WebCodecs tier, which has no FFmpeg decoder to read a frame SAR
+// off. The live mpegts demuxer's light probe never fills codecpar->sample_aspect_ratio (same reason
+// profile/level stay UNKNOWN), so av_guess returns 1:1. So do what mpv/FFmpeg do everywhere — read the SAR
+// off a DECODED FRAME — via a one-shot decode of the current keyframe (intra → one packet yields its frame).
+// All-codec (H.264 + HEVC + …), the exact mechanism the software vdec path already uses. One-time at setup;
+// 1:1 when unknown/square. Header-only would be cheaper but the SAR is only reliably set once a frame exists.
+static void demux_parse_sar(RDDemux* d, int* num, int* den) {
+    *num = 1; *den = 1;
+    if (!(d && d->vstream >= 0 && d->fmt && d->pkt && d->pkt->size > 0)) return;
+    AVStream* st = d->fmt->streams[d->vstream];
+    const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!dec) return;
+    AVCodecContext* ctx = avcodec_alloc_context3(dec);
+    if (!ctx) return;
+    AVFrame* fr = av_frame_alloc();
+    AVRational s = {0, 0};
+    if (fr && avcodec_parameters_to_context(ctx, st->codecpar) >= 0
+           && avcodec_open2(ctx, dec, NULL) >= 0
+           && avcodec_send_packet(ctx, d->pkt) == 0) {
+        avcodec_send_packet(ctx, NULL);                 // drain so a lone keyframe produces its frame
+        if (avcodec_receive_frame(ctx, fr) == 0) s = fr->sample_aspect_ratio;
+        if (s.num <= 0) s = ctx->sample_aspect_ratio;   // fallback: the decoder may set it on the context
+    }
+    if (s.num > 0 && s.den > 0) { *num = s.num; *den = s.den; }
+    av_frame_free(&fr);
+    avcodec_free_context(&ctx);
+}
+int ferrite_demux_v_sar_num(RDDemux* d) { int n, dn; demux_parse_sar(d, &n, &dn); return n; }
+int ferrite_demux_v_sar_den(RDDemux* d) { int n, dn; demux_parse_sar(d, &n, &dn); return dn; }
+
 // ===================== AUDIO =====================
 struct RDAudio {
     AVCodecContext* ctx;
     SwrContext* swr;
     AVFrame* frame;
     float* scratch; int scratch_cap;   // floats
-    int out_samples, rate, channels;
+    int out_samples, rate, channels;   // rate/channels = OUTPUT after swr (downmix to stereo + resample)
+    int src_channels;                  // decoded/source channel count, pre-downmix (telemetry only)
+    int out_rate_req;                  // requested output sample rate (0 = passthrough = decoded rate)
+    int drc_mode;                      // AC-3/E-AC-3 DRC: 0=line (authored), 1=RF/heavy, 2=loudness-norm
+    int swr_in_rate, swr_in_ch, swr_in_fmt, swr_out_rate; // what the live swr was configured for — a
+    // mid-stream SOURCE change (layout/rate/fmt: program/ad splice) or out-rate change triggers a rebuild
     int64_t pts_us;
+    float comp_env; // Dyna "Night" compressor: envelope-follower state (linear), persists across chunks
 };
 
 void ferrite_audio_free(RDAudio* a) {
@@ -501,6 +539,38 @@ RDAudio* ferrite_audio_new(int codec_id) {
     return audio_open(avcodec_find_decoder((enum AVCodecID)codec_id), NULL);
 }
 
+/* Dyna "Night" — a feed-forward dynamic-range compressor on the FINAL interleaved-stereo PCM (post-swr, in
+ * `a->scratch`). Universal + metadata-FREE (works on AAC/MP3/etc where codec DRC can't): tames loud peaks +
+ * lifts quiet passages so dialogue stays audible at low volume. IN-PLACE, N samples -> N samples, so the
+ * downstream sample count / media-PTS clock are UNAFFECTED (an avfilter graph re-chunks/buffers and fought
+ * the engine's 1-in-1-out audio_step → it slowed the audio + stalled; this can't). Peak detector with
+ * attack/release, soft-knee static curve above threshold, makeup gain, hard clip-guard. State persists
+ * across chunks. Curve is tunable. */
+static void aud_night_compress(RDAudio* a) {
+    int n = a->out_samples;
+    if (n <= 0 || !a->scratch || a->channels != 2) return;
+    float* s = a->scratch;
+    float sr = a->rate > 0 ? (float)a->rate : 48000.0f;
+    const float thresh = 0.0625f;        // ~-24 dBFS linear (catch the louder material)
+    const float inv_ratio_m1 = 1.0f / 4.0f - 1.0f; // 4:1 → gain = (env/thresh)^(1/ratio - 1)
+    const float makeup = 2.0f;           // +6 dB to lift dialogue (the AGC + volume set final level)
+    float atk = expf(-1.0f / (0.005f * sr)); // 5 ms attack
+    float rel = expf(-1.0f / (0.150f * sr)); // 150 ms release
+    float env = a->comp_env;
+    for (int i = 0; i < n; i++) {
+        float l = s[2 * i], r = s[2 * i + 1];
+        float al = fabsf(l), ar = fabsf(r);
+        float peak = al > ar ? al : ar;     // linked stereo (one gain) → preserves the image
+        env = (peak > env ? atk : rel) * (env - peak) + peak;
+        float g = makeup;
+        if (env > thresh) g = makeup * powf(env / thresh, inv_ratio_m1);
+        float ol = l * g, orr = r * g;
+        s[2 * i] = ol > 1.0f ? 1.0f : (ol < -1.0f ? -1.0f : ol);     // hard clip-guard (Web Audio clips at ±1)
+        s[2 * i + 1] = orr > 1.0f ? 1.0f : (orr < -1.0f ? -1.0f : orr);
+    }
+    a->comp_env = env;
+}
+
 // VOD/file path: build the audio decoder from the demuxer's chosen audio stream (carries extradata).
 RDAudio* ferrite_audio_new_from_demux(RDDemux* d) {
     if (!d || !d->fmt || d->astream < 0) return NULL;
@@ -525,21 +595,67 @@ int ferrite_audio_push(RDAudio* a, const uint8_t* data, uint32_t len, int64_t pt
 
 int ferrite_audio_step(RDAudio* a) {
     if (!a) return -1;
-    int r = avcodec_receive_frame(a->ctx, a->frame);
-    if (r == AVERROR(EAGAIN)) return 0;
-    if (r < 0) return -1;   // EOF or error
-    a->rate = a->frame->sample_rate;
-    a->channels = a->frame->ch_layout.nb_channels;
+    {
+        int r = avcodec_receive_frame(a->ctx, a->frame);
+        if (r == AVERROR(EAGAIN)) return 0;
+        if (r < 0) return -1;   // EOF or error
+    }
+    int in_rate = a->frame->sample_rate;
+    int out_rate = a->out_rate_req > 0 ? a->out_rate_req : in_rate;
+    a->rate = out_rate;
+    a->src_channels = a->frame->ch_layout.nb_channels;
     a->pts_us = (a->frame->pts == AV_NOPTS_VALUE) ? INT64_MIN : a->frame->pts;
+    // ONE swresample pass: downmix to interleaved-float STEREO + resample to the AudioContext rate,
+    // before the PCM crosses to Web Audio. Surround (e.g. EAC3 5.1) folds here with FFmpeg's BS.775
+    // matrix (center/surround -3 dB = 0.7071, LFE dropped) — higher quality than, and one place instead
+    // of, Web Audio's per-render-quantum auto-downmix. Resampling to out_rate here (one STATEFUL,
+    // continuous resampler) replaces the browser's per-AudioBuffer resample on non-48k devices — that
+    // per-chunk resample left audible boundary ticks/flanging. Mono → duplicated stereo; matched
+    // stereo+rate → identity convert. OUTPUT is always 2 channels at out_rate.
+    int in_fmt = a->frame->format;
+    // Rebuild the swr when its configured INPUT (rate/channels/fmt) or the OUTPUT rate no longer matches
+    // this frame — a mid-stream source change (program/ad splice on live IPTV: 5.1→2.0, or a different
+    // sample rate) would otherwise feed the new layout/rate through the old resampler config → wrong
+    // matrix / wrong pitch / swr_convert error that kills audio.
+    if (a->swr && (in_rate != a->swr_in_rate || a->src_channels != a->swr_in_ch
+                   || in_fmt != a->swr_in_fmt || out_rate != a->swr_out_rate)) {
+        swr_free(&a->swr);
+    }
     if (!a->swr) {
-        if (swr_alloc_set_opts2(&a->swr,
-                &a->frame->ch_layout, AV_SAMPLE_FMT_FLT, a->rate,
-                &a->frame->ch_layout, (enum AVSampleFormat)a->frame->format, a->rate,
-                0, NULL) < 0 || swr_init(a->swr) < 0) {
+        AVChannelLayout in_layout;
+        if (a->src_channels > 0 && a->frame->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
+            av_channel_layout_copy(&in_layout, &a->frame->ch_layout);
+        } else {
+            // Decoder left the layout unspecified — derive the canonical default for the channel count
+            // so swresample has a valid input mapping (else swr_init fails and audio dies).
+            av_channel_layout_default(&in_layout, a->src_channels > 0 ? a->src_channels : 2);
+        }
+        AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_STEREO;
+        int ok = swr_alloc_set_opts2(&a->swr,
+                &out_layout, AV_SAMPLE_FMT_FLT, out_rate,
+                &in_layout, (enum AVSampleFormat)in_fmt, in_rate,
+                0, NULL) >= 0;
+        if (ok) av_opt_set_double(a->swr, "center_mix_level", 0.7071, 0); // -3 dB, before swr_init
+        // Clip protection: a Lo/Ro fold can sum past ±1 on hot content (L = FL + 0.707·FC + 0.707·SL),
+        // and swresample does NOT normalize by default → Web Audio hard-clips → audible distortion on
+        // loud surround passages. rematrix_maxval=1.0 scales the downmix matrix so no summed output can
+        // exceed full-scale. Tradeoff: global level drop only when surround is actually present (pure
+        // stereo/mono pass at unity); a peak-only soft limiter is the alternative if this is too quiet.
+        if (ok) av_opt_set_double(a->swr, "rematrix_maxval", 1.0, 0); // before swr_init
+        if (!ok || swr_init(a->swr) < 0) {
+            av_channel_layout_uninit(&in_layout);
+            if (a->swr) swr_free(&a->swr);
             return -1;
         }
+        av_channel_layout_uninit(&in_layout);
+        a->swr_in_rate = in_rate; a->swr_in_ch = a->src_channels;
+        a->swr_in_fmt = in_fmt;   a->swr_out_rate = out_rate;
     }
-    int need = a->frame->nb_samples * a->channels;
+    a->channels = 2; // engine output is stereo
+    // swr_get_out_samples = upper bound of output frames for this input (incl. the resampler's buffered/
+    // delay samples), so the scratch is sized exactly and swr_convert can never overflow it.
+    int out_cap = swr_get_out_samples(a->swr, a->frame->nb_samples);
+    int need = out_cap * a->channels;
     if (a->scratch_cap < need) {
         free(a->scratch);
         a->scratch = (float*)malloc((size_t)need * sizeof(float));
@@ -547,16 +663,69 @@ int ferrite_audio_step(RDAudio* a) {
         if (!a->scratch) return -1;
     }
     uint8_t* out = (uint8_t*)a->scratch;
-    int got = swr_convert(a->swr, &out, a->frame->nb_samples,
+    int got = swr_convert(a->swr, &out, out_cap,
                           (const uint8_t**)a->frame->extended_data, a->frame->nb_samples);
     if (got < 0) return -1;
     a->out_samples = got;
+    if (a->drc_mode == 2) aud_night_compress(a); // Dyna "Night": in-place compress the stereo PCM
+    return 1;
+}
+// EOF/end-of-stream drain: emit the resampler's internally buffered/delay samples (the swr conversion
+// delay) that swr_convert leaves behind after the last real frame. Call AFTER the avcodec EOF drain has
+// returned 0 (no more decoded frames). 1 = a final chunk is ready in `scratch` (read via the usual
+// interleaved/samples getters); 0 = nothing buffered. VOD-only path — without this the file's last few
+// tens of ms (the resampler delay line) are silently truncated. Repeated calls are safe (return 0 once
+// drained). Live never hits EOF, so this never runs mid-stream.
+int ferrite_audio_flush(RDAudio* a) {
+    if (!a || !a->swr) return 0;
+    int out_cap = swr_get_out_samples(a->swr, 0); // buffered/delay samples still inside swr
+    if (out_cap <= 0) return 0;
+    int need = out_cap * a->channels;
+    if (a->scratch_cap < need) {
+        free(a->scratch);
+        a->scratch = (float*)malloc((size_t)need * sizeof(float));
+        a->scratch_cap = a->scratch ? need : 0;
+        if (!a->scratch) return 0;
+    }
+    uint8_t* out = (uint8_t*)a->scratch;
+    int got = swr_convert(a->swr, &out, out_cap, NULL, 0); // NULL in = flush the delay line
+    if (got <= 0) return 0;
+    a->out_samples = got;
+    if (a->drc_mode == 2) aud_night_compress(a);
     return 1;
 }
 const float* ferrite_audio_interleaved(RDAudio* a) { return a->scratch; }
 uint32_t     ferrite_audio_samples(RDAudio* a) { return (uint32_t)a->out_samples; }
 uint32_t     ferrite_audio_rate(RDAudio* a) { return (uint32_t)a->rate; }
-uint32_t     ferrite_audio_channels(RDAudio* a) { return (uint32_t)a->channels; }
+uint32_t     ferrite_audio_channels(RDAudio* a) { return (uint32_t)a->channels; }      // output (stereo)
+uint32_t     ferrite_audio_src_channels(RDAudio* a) { return (uint32_t)a->src_channels; } // pre-downmix
+// Set the desired OUTPUT sample rate (the AudioContext rate). 0 = passthrough (decoded rate). Just
+// records the request; audio_step rebuilds the swr on the next frame when out_rate != swr_out_rate (same
+// path as a mid-stream source change). In practice the facade sets this ONCE before audio flows, so the
+// rebuild happens on the first frame (no delay-line to drop); a true mid-stream change would glitch once.
+void ferrite_audio_set_out_rate(RDAudio* a, int rate) {
+    if (!a || rate < 0) return;
+    a->out_rate_req = rate;
+}
+
+// Dyna mode (the repurposed DRC control): 0 = LINE (authored codec DRC only), 1 = RF/HEAVY (Dolby heavy
+// compression — AC3/EAC3 metadata only), 2 = NIGHT (decoder stays LINE + the universal `aud_night_compress`
+// stage in audio_step, which works on ANY audio incl. AAC/MP3). The codec AVOptions live on the decoder's
+// private class (AV_OPT_SEARCH_CHILDREN) → no-op on non-Dolby decoders (AAC etc.).
+void ferrite_audio_set_drc(RDAudio* a, int mode) {
+    if (!a) return;
+    a->drc_mode = mode;
+    if (a->ctx) {
+        double scale = 1.0; int64_t heavy = 0, target = 0;
+        if (mode == 1) heavy = 1; // RF / heavy
+        av_opt_set_double(a->ctx, "drc_scale", scale, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(a->ctx, "heavy_compr", heavy, AV_OPT_SEARCH_CHILDREN);
+        av_opt_set_int(a->ctx, "target_level", target, AV_OPT_SEARCH_CHILDREN);
+    }
+    // Night (mode 2) = the in-place `aud_night_compress` stage in audio_step (no decoder AVOption); reset the
+    // compressor envelope on a mode change so it doesn't carry stale state into a fresh engage.
+    if (mode != 2) a->comp_env = 0.0f;
+}
 int64_t      ferrite_audio_pts_us(RDAudio* a) { return a->pts_us; }
 
 // ===================== VIDEO (generic avcodec decode) =====================

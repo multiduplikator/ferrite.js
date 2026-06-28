@@ -110,7 +110,7 @@ let stop = false;
 let closing = false;    // 'destroy' received → terminal; never cleared (gates load/run so a queued
                         // load can't resurrect a pipeline after we've terminated the thread pool)
 let gen = 0;            // current load generation; loops capture it and self-cancel when it changes
-// LIVE/VOD UNIFICATION (Tier 1): the SINGLE source-policy descriptor for this load. Computed at `load`
+// The SINGLE source-policy descriptor (live/VOD) for this load. Computed at `load`
 // from the declared intent (deriveCapabilities(msg.isLive)) and REFINED once from the first response's
 // headers (live: ingest onConnect; VOD: HttpSource.open), then posted to main as `caps`. Every worker-
 // side live/VOD fork reads a field of THIS — `declaredLive` (transport/ingest + decoder-init, decided
@@ -141,7 +141,7 @@ let vodSource: HttpSource | null = null;
 // (unload/destroy → stopPipeline) can abort the in-flight `/proxy` fetch SYNCHRONOUSLY rather than
 // waiting for the next `reader.read()` to resolve (the only thing the per-attempt `alive()` check
 // reacts to) or for main's eventual `Worker.terminate()`. Without this, a fast destroy handshake
-// (which the faster destroy handshake / Tier-1a sped up to reap the pthread pool) preempts the ingest loop's own per-attempt
+// (which the faster destroy handshake sped up to reap the pthread pool) preempts the ingest loop's own per-attempt
 // `finally` abort before the next byte arrives, leaving the socket for terminate() to close — and a
 // terminate()'d worker's fetch is not guaranteed to FIN promptly, so the demo proxy keeps draining the
 // bridge and the subscriber lingers / accumulates ("1 stream → 2 subscribers"). Aborting here fires
@@ -297,6 +297,19 @@ let autoSkipLoop = false;
 // Software deinterlace mode (0=off, 1=auto, 3=bwdif); set via the `setDeint` message, default auto.
 // Re-applied (ferrite_vdec_set_deint) at every software-decoder (re)create; the WC/HW tier ignores it.
 let deintMode = 1;
+// Audio dynamics ("Dyna") mode (0=line, 1=RF/heavy, 2=night); set via the `setDrc` message, default line.
+// Re-applied (ferrite_audio_set_drc) at every audio-decoder (re)create — audio is always software-decoded.
+let drcMode = 0;
+// Engine OUTPUT sample rate = the AudioContext rate, forwarded from main (`setAudioOutRate`); 0 = passthrough
+// (decoded rate). The engine resamples to it in one stateful swresample pass (replacing Web Audio's per-chunk
+// resample). Re-applied (ferrite_audio_set_out_rate) at every audio-decoder (re)create.
+let audioOutRate = 0;
+/** Apply the remembered audio decoder options (Dyna mode + output rate) to a fresh audio decoder. Read by
+ *  the engine per-frame / on the next swr build, so it takes effect mid-stream. No-op on a null adec or
+ *  against an engine wasm that predates the setters (the bindings soft-no-op). */
+function applyAudioOpts(a: number): void {
+  if (F && a) { F.audioSetOutRate(a, audioOutRate); F.audioSetDrc(a, drcMode); }
+}
 /** Apply the EFFECTIVE skip lever state (manual OR auto) to a software video decoder (no-op for the WC
  *  tier / a null vdec). Read by avcodec PER FRAME, so this takes effect mid-stream with no re-init. */
 function applySkips(v: number): void {
@@ -338,13 +351,14 @@ function holdAndPostFrame(w: number, h: number, cw: number, ch: number): boolean
   if (!F || !vdec) return false;
   const token = F.vdecHold(vdec);
   if (token === 0) { frameDrops++; return false; }
+  resolveVsar(); // software: a frame is decoded → vdecSar (bitstream VUI) is authoritative (no-op once resolved)
   const bitDepth = F.vdecBitdepth(vdec);
   const colorspace = F.vdecColorspace(vdec); // AVColorSpace (matrix_coefficients) — software YUV→RGB selection
   const colorRange = F.vdecColorRange(vdec); // AVColorRange (limited/full)
   const colorTrc = F.vdecColorTrc(vdec);     // AVColorTransferCharacteristic (PQ=16/HLG=18 → HDR tone-map)
   const ptrs: [number, number, number] = [F.vdecHeldPlane(token, 0), F.vdecHeldPlane(token, 1), F.vdecHeldPlane(token, 2)];
   const lns: [number, number, number] = [F.vdecHeldLinesize(token, 0), F.vdecHeldLinesize(token, 1), F.vdecHeldLinesize(token, 2)];
-  postFrame({ type: 'frame', gen, ptsUs: F.vdecPts(vdec), w, h, cw, ch, bitDepth, colorspace, colorRange, colorTrc, token, ptrs, lns, contentPeriodUs, demuxRingBytes: demux ? F.demuxBuffered(demux) : 0 });
+  postFrame({ type: 'frame', gen, ptsUs: F.vdecPts(vdec), w, h, cw, ch, bitDepth, colorspace, colorRange, colorTrc, sarNum: vsarNum, sarDen: vsarDen, token, ptrs, lns, contentPeriodUs, demuxRingBytes: demux ? F.demuxBuffered(demux) : 0 });
   postedCount++;
   credits--;
   heldFrames++; // authoritative in-flight held count (released by the present worker's `release`)
@@ -377,6 +391,7 @@ function failFatal(kind: FerriteFailureKind, code: number, msg: string): void {
 
 /** Free the current demux + decoders (no flag/stop changes). Used before a (re)load alloc + on teardown. */
 function freeDecoders(): void {
+  vsarNum = 1; vsarDen = 1; vsarResolved = false; // re-resolve the anamorphic SAR for the next stream
   freeWc();
   if (F) {
     if (vdec) F.vdecFree(vdec);
@@ -461,7 +476,10 @@ function createWcDecoder(codec: string): void {
       // `release.vf` ack) — the WC analog of `heldFrames`, read by the feed-backpressure gate.
       wcInFlight++;
       const ptsUs = frame.timestamp;
-      postFrame({ type: 'vframe', gen, ptsUs, frame, contentPeriodUs, demuxRingBytes: F && demux ? F.demuxBuffered(demux) : 0 }, [frame]);
+      // SAR was resolved at the keyframe in the demux pump (resolveVsar(true)) — the WC tier has no local
+      // decoder to read a frame SAR off, so it rides the cached value here. (Display GEOMETRY is derived
+      // present-side from the frame's own coded dims — see the present-worker WC path.)
+      postFrame({ type: 'vframe', gen, ptsUs, frame, sarNum: vsarNum, sarDen: vsarDen, contentPeriodUs, demuxRingBytes: F && demux ? F.demuxBuffered(demux) : 0 }, [frame]);
     },
     error: (e: DOMException) => handleWcError('' + e),
   });
@@ -554,11 +572,38 @@ function fallbackToSoftware(): void {
   announce();
 }
 
+// ANAMORPHIC SAR (Phase B): ONE pixel-aspect for BOTH tiers. The WebCodecs tier has no FFmpeg decoder to
+// read a frame SAR off, and the live mpegts probe never fills codecpar SAR — so the engine resolves it via
+// a one-shot keyframe decode in the demuxer (ferrite_demux_v_sar_*), the single source used by software AND
+// WebCodecs. Cached per stream (the demux getter decodes a keyframe — not for the hot path). Falls back to
+// the software frame SAR (vdecSar, always available) when the demux getter is absent (engine wasm predates
+// it) or returns square; 1:1 otherwise. Rides each frame to the present worker (present sizes the canvas
+// backing to coded_w × SAR; the texture stays at coded dims, the sampler stretches).
+let vsarNum = 1, vsarDen = 1, vsarResolved = false;
+// `atKeyframe` MUST be true only when the demux's CURRENT packet is a decodable video keyframe — the demux
+// one-shot SAR getter one-shot-decodes that packet and returns 1:1 INDISTINGUISHABLY for both "genuinely
+// square" AND "couldn't decode this packet", so trusting it on a non-keyframe would lock a false 1:1 (the
+// anamorphic "too tall" bug). The software decoded-frame SAR (vdecSar, bitstream VUI) is authoritative
+// whenever a frame exists, so it's tried first; the demux getter (the ONLY SAR source for the WebCodecs
+// tier, which has no local decoder) is consulted only at a keyframe. (WebCodecs DISPLAY geometry is handled
+// entirely present-side from the frame's own coded dims — no demux involvement; see present-worker WC path.)
+function resolveVsar(atKeyframe = false): void {
+  if (vsarResolved || !F) return;
+  let n = vdec ? F.vdecSarNum(vdec) : 0;          // software: decoded-frame SAR, authoritative once a frame exists
+  let d = vdec ? F.vdecSarDen(vdec) : 0;
+  if (!(n > 0 && d > 0) && atKeyframe && demux) { // WebCodecs / pre-first-frame: demux one-shot AT a keyframe
+    n = F.demuxVSarNum(demux); d = F.demuxVSarDen(demux);
+  }
+  if (n > 0 && d > 0) { vsarNum = n; vsarDen = d; vsarResolved = true; }
+}
+
 /** Tell main the active tier + codecs + dims (drives statisticsInfo.tier + mediaInfo). */
 function announce(): void {
-  // DISPLAY aspect (anamorphic): SAR from the current frame so the facade computes DAR = width·SAR/height.
+  // DISPLAY aspect (anamorphic): the SINGLE demux-resolved SAR for BOTH tiers, so the facade computes
+  // DAR = width·SAR/height identically on software and WebCodecs (fixes the squished HW-path anamorphic).
+  resolveVsar();
   post({ type: 'ready', info: { videoCodec: curVcodec, audioCodec: curAcodec, width: annW, height: annH,
-    sarNum: (F && vdec) ? F.vdecSarNum(vdec) : 1, sarDen: (F && vdec) ? F.vdecSarDen(vdec) : 1, tier } });
+    sarNum: vsarNum, sarDen: vsarDen, tier } });
 }
 
 /** Wrap one demuxed video AU as an EncodedVideoChunk and feed the hardware decoder. `ptsUs<0` (no
@@ -751,6 +796,19 @@ self.onmessage = async (e: MessageEvent<MainToWorker>) => {
       deintMode = msg.mode;
       if (F && !useWc && vdec) F.vdecSetDeint(vdec, deintMode);
       break;
+    case 'setDrc':
+      // Dyna (audio dynamics): remember the mode + apply it LIVE to the current audio decoder (read by
+      // the engine per-frame → honoured mid-stream). Re-applied on every audio-decoder (re)create.
+      drcMode = msg.mode;
+      if (F && adec) F.audioSetDrc(adec, drcMode);
+      break;
+    case 'setAudioOutRate':
+      // The AudioContext output rate, forwarded from main: the engine resamples to it in one stateful
+      // swresample pass. Remember it + apply LIVE (rebuilds the swr on the next frame); re-applied on
+      // every audio-decoder (re)create.
+      audioOutRate = msg.rate;
+      if (F && adec) F.audioSetOutRate(adec, audioOutRate);
+      break;
     case 'unload':
       // Tear down the current pipeline but keep the engine. `gen` already moved on the next
       // load; bumping past `msg.gen` here cancels in-flight loops even with no follow-up load.
@@ -911,6 +969,7 @@ async function doVodSeek(tgtUs: number): Promise<void> {
   if (adec) {
     F.audioFree(adec); adec = F.audioNewFromDemux(demux);
     if (!adec) { failFatal('decode', -1, 'VOD seek: audio decoder re-alloc failed'); return; }
+    applyAudioOpts(adec); // re-apply Dyna + out-rate after the VOD-seek audio-decoder recreate
   }
 }
 
@@ -958,7 +1017,7 @@ async function runVod(myGen: number, url: string): Promise<void> {
     //    extradata that _from_demux / the WC `description` carries). Audio is ALWAYS software/WebAudio.
     const vc = F.demuxVcodec(myDemux);
     const ac = F.demuxAcodec(myDemux);
-    if (ac > 0) { adec = F.audioNewFromDemux(myDemux); if (adec) curAcodec = ac; }
+    if (ac > 0) { adec = F.audioNewFromDemux(myDemux); if (adec) { curAcodec = ac; applyAudioOpts(adec); } }
     // VOD VIDEO TIER SELECTION (VOD-WC parity) — the SAME gate live uses (webCodecsEligible + the cached WC
     // capability), but VOD reads the demuxer's RESOLVED profile/level + the container extradata (avcC/hvcC)
     // rather than the in-band SPS, and configures the VideoDecoder with that extradata as `description` (the
@@ -1064,6 +1123,7 @@ async function runVod(myGen: number, url: string): Promise<void> {
           // during the wait, so ptr stays valid, but capturing the bytes now is the rule).
           const au = F.auCopy(ptr, size);
           const isKey = F.demuxPktIsKey(myDemux) === 1;
+          if (isKey) resolveVsar(true); // anamorphic SAR: demux one-shot is reliable only AT a keyframe (WC-VOD; software resolves via vdecSar)
           // (a) FEED BACKPRESSURE — WAIT (never shed) while the decoder's OWN encoded queue is at its
           // ceiling, so the VideoDecoder can never over-fill (the decode-q→314 stall). Gating SOLELY on the
           // self-draining decodeQueueSize cannot deadlock. Break on teardown / a pending
@@ -1443,7 +1503,7 @@ async function pump(myGen: number): Promise<void> {
     if (ac > 0 && ac !== curAcodec) {
       if (adec) F.audioFree(adec);
       adec = F.audioNew(ac);
-      if (adec) { curAcodec = ac; announce(); }
+      if (adec) { curAcodec = ac; applyAudioOpts(adec); announce(); }
     }
 
     const step = F.demuxStep(demux);
@@ -1459,6 +1519,7 @@ async function pump(myGen: number): Promise<void> {
     if (stream === 0) {
       feedVidPktPeriod(pts >= 0n ? Number(pts) : -1); // TRUE content period (non-ref-skip-independent) → present cap
       const isKey = F.demuxPktIsKey(demux) === 1;
+      if (isKey) resolveVsar(true); // anamorphic SAR: the demux one-shot decode is reliable only AT a keyframe (d->pkt is it now)
       // Track the largest video PES (running MAX, monotonic) + warm on the first keyframe (the
       // GOP's largest PES); recompute the adaptive low-water / read-ahead so a low-bitrate stream
       // relaxes to a tight buffer while 4K keeps its full-PES floor. `size` is

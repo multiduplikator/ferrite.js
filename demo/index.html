@@ -26,14 +26,23 @@
     <h1>ferrite.js</h1>
     <input id="url" type="text" placeholder="Stream URL (cross-origin auto-proxied); blank = fixture" />
     <label><input type="checkbox" id="live" checked /> live</label>
+    <!-- Capability matrix — generate with `bash demo/gen_matrix.sh` (self-contained; → assets/cap_*).
+         TS clips push via /faux-live (live); MP4/MKV stream via the Range static handler (VOD · seek). -->
     <select id="fixture">
-      <option value="fixture_synth_1080_h264_50_60s.ts">synth 1080 h264 50</option>
-      <option value="fixture_real_1080_hevc_25_60s.ts">real 1080 hevc 25</option>
-      <option value="fixture_real_1440_8_50_60s.ts">real 1440 hevc 8 50</option>
-      <option value="fixture_real_2160_8_25_60s.ts">real 2160 hevc 8 25</option>
-      <option value="fixture_real_2160_10_50_60s.ts">real 2160 hevc 10 50</option>
-      <option value="fixture_lab_2160_10_50.ts">lab 2160 hevc 10 50</option>
-      <option value="fixture_4k50_hlg.m2ts">real 2160 HLG HDR 50</option>
+      <optgroup label="capability matrix — TS (live)">
+        <option value="cap_ts_hevc2160_10hlg_eac3.ts">TS · HEVC 2160p50 · 10-bit HLG · EAC3 5.1 (hev1 · HDR · downmix)</option>
+        <option value="cap_ts_h264_1080i_ac3.ts">TS · H264 1080i · AC3 (interlaced · deint)</option>
+        <option value="cap_ts_mpeg2_1080i_mp2.ts">TS · MPEG-2 1080i · MP2 (broadcast)</option>
+        <option value="cap_ts_h264_2160_noaudio.ts">TS · H264 2160p50 · no audio</option>
+        <option value="cap_aspect_h264_1440x1080.ts">TS · anamorphic 1440×1080 → 16:9 · H.264 · AAC (circle)</option>
+        <option value="cap_aspect_hevc_1440x1080.ts">TS · anamorphic 1440×1080 → 16:9 · HEVC hev1 · MP3 (circle · SW off-HW)</option>
+      </optgroup>
+      <optgroup label="capability matrix — MP4 / MKV (VOD · seek)">
+        <option value="cap_mp4_hevc1080_aac.mp4">MP4 · HEVC 1080p50 · AAC (hvc1 · seek)</option>
+        <option value="cap_mp4_h264_1440_aac.mp4">MP4 · H264 1440p50 · AAC (seek)</option>
+        <option value="cap_mkv_h264_1080_aac.mkv">MKV · H264 1080p50 · AAC (seek)</option>
+        <option value="cap_mkv_hevc1440_ac3.mkv">MKV · HEVC 1440p50 · AC3 (hvc1 · seek)</option>
+      </optgroup>
     </select>
     <button id="play">Play</button>
     <button id="stop" disabled>Stop</button>
@@ -63,14 +72,17 @@
     const DEBUG = new URLSearchParams(location.search).get('debug') !== '0';
     const THREADS = Math.max(2, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
     const fixture = () => $('fixture').value;
+    // MP4/MKV fixtures are VOD (range-streamed + seekable); .ts/.m2ts are pushed as faux-live.
+    const isVodFixture = () => /\.(mp4|mkv|mov)$/i.test(fixture());
 
     let player = null, controls = null, statsTimer = null;
 
-    // Resolve the play target to a URL the worker can fetch: blank → the selected fixture's /faux-live;
+    // Resolve the play target to a URL the worker can fetch: blank → the selected fixture (a VOD fixture
+    // streams from /assets via the Range static handler; a live fixture push-streams via /faux-live);
     // a same-origin path → pass through; a cross-origin http(s) URL → bridge through /proxy (COEP).
     function resolveUrl() {
       const raw = $('url').value.trim();
-      if (!raw) return `/faux-live?file=assets/${fixture()}`;
+      if (!raw) return isVodFixture() ? `/assets/${fixture()}` : `/faux-live?file=assets/${fixture()}`;
       if (raw.startsWith('/')) return raw;
       let u; try { u = new URL(raw, location.href); } catch { return raw; }
       if (u.origin === location.origin) return raw;
@@ -91,7 +103,7 @@
 
     $('play').onclick = async () => {
       if (!Ferrite.isSupported()) { setStatus('unsupported: needs WebGL2 + AudioContext + WebAssembly'); return; }
-      const isLive = $('url').value.trim() ? $('live').checked : true; // blank URL → fixture is live-only
+      const isLive = $('url').value.trim() ? $('live').checked : !isVodFixture(); // blank URL → live for .ts, VOD for .mp4/.mkv
       const url = resolveUrl();
       teardown();
 
@@ -142,8 +154,10 @@
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       teardown(); $('stop').disabled = true;
       clearOut();
-      out(`leak-test: ${CYCLES} cycles · ${fixture()}`);
-      const url = `/faux-live?file=assets/${fixture()}`;
+      // The leak-test push-streams as faux-live (live mpegts) → use a TS fixture; fall back if a VOD one is picked.
+      const tsFixture = isVodFixture() ? 'cap_ts_h264_2160_noaudio.ts' : fixture();
+      out(`leak-test: ${CYCLES} cycles · ${tsFixture}`);
+      const url = `/faux-live?file=assets/${tsFixture}`;
       let leaks = 0;
       for (let i = 1; i <= CYCLES; i++) {
         const old = $('screen'); old.replaceWith(old.cloneNode(false));

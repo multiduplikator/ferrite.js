@@ -1,4 +1,4 @@
-// SourceCapabilities — the SINGLE source-policy descriptor (LIVE/VOD UNIFICATION, Tier 1). The player is
+// SourceCapabilities — the SINGLE source-policy descriptor (live/VOD). The player is
 // ONE engine (decode/present/clock/tier/degrade shared); the live/VOD split is a thin policy band that
 // used to live as ~8 scattered `isLive` forks across the worker, controller, and facade. This descriptor
 // REPLACES that scattered bool: it is computed ONCE at open from TWO zero-cost inputs and the 8 forks read

@@ -20,6 +20,8 @@ _ferrite_demux_pkt_dts_us
 _ferrite_demux_pkt_is_key
 _ferrite_demux_v_profile
 _ferrite_demux_v_level
+_ferrite_demux_v_sar_num
+_ferrite_demux_v_sar_den
 _ferrite_demux_v_extradata
 _ferrite_demux_v_extradata_size
 _ferrite_demux_reset_v_extradata
@@ -28,10 +30,14 @@ _ferrite_audio_new
 _ferrite_audio_new_from_demux
 _ferrite_audio_push
 _ferrite_audio_step
+_ferrite_audio_flush
 _ferrite_audio_interleaved
 _ferrite_audio_samples
 _ferrite_audio_rate
 _ferrite_audio_channels
+_ferrite_audio_src_channels
+_ferrite_audio_set_out_rate
+_ferrite_audio_set_drc
 _ferrite_audio_pts_us
 _ferrite_audio_free
 _ferrite_vdec_new

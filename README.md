@@ -110,9 +110,12 @@ const controls = attachControls(player, canvas);   // auto-hiding bar + long-pre
 controls.destroy();
 ```
 
-- **Controls bar** (auto-hides after idle): play/pause, mute, volume, fullscreen, a LIVE badge.
-- **Debug overlay** — *long-press the video* to toggle (off by default). Rows: `isolated`, `tier`,
-  `format`, `status`, `clock`. It is the perfect **first-run diagnostic on a device with no devtools**
+- **Controls bar** (auto-hides after idle): play/pause, mute, volume, an **audio-dynamics ("Dyna")**
+  selector (Line / RF / Night), a **deinterlace ("Deint")** selector (Off / Auto / Bwdif, shown on the
+  software tier only), fullscreen, a **LIVE** badge for live, and a **scrub bar + time** for VOD.
+- **Debug overlay** — *long-press the video* to toggle (off by default). Rows include `isolated`,
+  `tier`, `format`, `status`, `clock`, decode/present cadence, buffers, and audio-sync. It is the
+  perfect **first-run diagnostic on a device with no devtools**
   (e.g. an iPad PWA): if it shows **`isolated: NO (no SharedArrayBuffer)`**, your page is not
   cross-origin isolated and the decoder cannot run — fix COOP/COEP (below).
 
@@ -215,9 +218,11 @@ the full build details, and [`tests/README.md`](./tests/README.md) for the node 
 - `Events` — `ERROR`, `MEDIA_INFO`, `STATISTICS_INFO`, `LOADING_COMPLETE`, `RECOVERED_EARLY_EOF`,
   `DESTROYING`, plus ferrite extensions (`TIME_UPDATE`, `LOG`, `DEINT_FAILED`)
 - `ErrorTypes` / `ErrorDetails` / `LoaderErrors` — verbatim mpegts.js strings
-- `FerritePlayer` — `attachCanvas`, `load`, `play`, `pause`, `unload`, `detachMediaElement`, `destroy`,
-  `recover`, `on`/`off`; props `paused`, `currentTime`, `duration`, `volume`, `muted`, `tier`,
-  `videoWidth`/`videoHeight`, `mediaInfo`, `statisticsInfo`
+- `FerritePlayer` — `attachCanvas`, `load`, `play`, `pause`, `seek`, `unload`, `detachMediaElement`,
+  `destroy`, `recover`, `on`/`off`, plus ferrite extensions `setDeint(mode)` (0 off / 1 auto / 3 bwdif,
+  software tier) and `setDrc(mode)` (audio dynamics: 0 line / 1 RF / 2 night); props `paused`,
+  `currentTime`, `duration`, `volume`, `muted`, `tier`, `videoWidth`/`videoHeight`, `mediaInfo`,
+  `statisticsInfo`
 - `ferrite.js/controls` — `attachControls(player, target, options?) → { destroy() }`
 
 ## License

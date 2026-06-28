@@ -18,6 +18,14 @@
 
 import { selectColorConditioning, hdrMode, bayer8, BAYER_8 } from './color';
 
+/** Display (DAR-correct) width from coded width × sample aspect (anamorphic). The canvas BACKING is sized
+ *  to this while the texture stays at coded dims, so the GPU sampler stretches non-square pixels to the
+ *  right shape (1440×1080 SAR 4:3 → 1920 backing → DAR 16:9). 1:1 / unknown SAR returns the coded width. */
+function displayW(codedW: number, sarNum: number, sarDen: number): number {
+  if (sarNum > 0 && sarDen > 0 && sarNum !== sarDen) return Math.round(codedW * sarNum / sarDen);
+  return codedW;
+}
+
 const VERT = `#version 300 es
 in vec2 p; out vec2 uv;
 void main(){ uv = vec2(p.x*0.5+0.5, 0.5-p.y*0.5); gl_Position = vec4(p,0.0,1.0); }`;
@@ -139,6 +147,11 @@ export class GlRenderer {
   private h = 0;
   private cw = 0;
   private ch = 0;
+  // Canvas BACKING dims (the texture stays at coded `w`×`h`; the sampler stretches to these). Shared by BOTH
+  // tiers so a WebCodecs↔software switch that changes the backing re-triggers the resize gate. Software:
+  // dispW = coded_w × SAR, dispH = h. WebCodecs: passed in by the caller (SAR-applied width × display height).
+  private dispW = 0;
+  private dispH = 0;
   private bitDepth = 0;               // current software texture bit depth (8/10/12); 0 ⇒ none yet
   private cs = -1;                    // last-applied colorspace (AVColorSpace) — re-resolve uniforms on change
   private cr = -1;                    // last-applied color_range (AVColorRange)
@@ -228,17 +241,24 @@ export class GlRenderer {
     w: number, h: number, cw: number, ch: number, bitDepth: number,
     colorspace = 2 /* AVCOL_SPC_UNSPECIFIED */, colorRange = 0 /* AVCOL_RANGE_UNSPECIFIED */,
     colorTrc = 2 /* AVCOL_TRC_UNSPECIFIED */,
+    sarNum = 1, sarDen = 1,
   ): void {
     const gl = this.gl;
     const bd16 = bitDepth > 8;
     const ifmt = bd16 ? gl.R16UI : gl.R8UI;
     const type = bd16 ? gl.UNSIGNED_SHORT : gl.UNSIGNED_BYTE;
-    const resize = w !== this.w || h !== this.h || cw !== this.cw || ch !== this.ch || bitDepth !== this.bitDepth;
+    // The textures stay at CODED dims (w×h, cw×ch); the canvas BACKING is the DISPLAY (anamorphic) size so
+    // the sampler stretches non-square pixels. Software frames are already conformance-cropped by FFmpeg, so
+    // the backing height is the frame `h`. A SAR change alone re-sizes the backing (texture unchanged).
+    const dispW = displayW(w, sarNum, sarDen), dispH = h;
+    const resize = w !== this.w || h !== this.h || cw !== this.cw || ch !== this.ch || bitDepth !== this.bitDepth
+                   || dispW !== this.dispW || dispH !== this.dispH;
     if (resize) {
       this.w = w; this.h = h; this.cw = cw; this.ch = ch; this.bitDepth = bitDepth;
-      this.canvas.width = w;
-      this.canvas.height = h;
-      gl.viewport(0, 0, w, h);
+      this.dispW = dispW; this.dispH = dispH;
+      this.canvas.width = dispW;
+      this.canvas.height = dispH;
+      gl.viewport(0, 0, dispW, dispH);
     }
     gl.useProgram(this.progYuv);
     gl.uniform1f(this.bitScaleLoc, (1 << bitDepth) - 1); // 255 / 1023 / 4095
@@ -262,19 +282,27 @@ export class GlRenderer {
   }
 
   /** WEBCODECS tier: upload a VideoFrame to the RGBA texture (unit 3) and draw via the passthrough
-   *  program. The caller owns the VideoFrame and MUST `.close()` it after (frees the decoder pool).
-   *  Sizes the canvas to the frame's display dims (self-correcting on a mid-stream resolution change). */
-  drawFrame(frame: VideoFrame): void {
+   *  program. The caller owns the VideoFrame and MUST `.close()` it after (frees the decoder pool). The
+   *  caller passes the BACKING dims explicitly: `dispW` = the SAR-applied display width (anamorphic stretch),
+   *  `dispH` = the display height. These come from the demuxer's browser-independent ground-truth geometry —
+   *  NOT the frame's display_width/height, which some HW decoders (e.g. Edge's HEVC path) report bogus; the
+   *  caller re-wraps the frame so texImage2D uploads the matching visible region. The texture itself is the
+   *  (re-wrapped) frame. */
+  drawFrame(frame: VideoFrame, dispW: number, dispH: number): void {
     const gl = this.gl;
-    const w = frame.displayWidth, h = frame.displayHeight;
-    if (w !== this.w || h !== this.h) {
+    // codedWidth/Height track the texture-source resolution for the resize gate (re-upload on a real change).
+    const w = frame.codedWidth, h = frame.codedHeight;
+    if (w !== this.w || h !== this.h || dispW !== this.dispW || dispH !== this.dispH) {
       // Reset chroma dims + bit depth too so a later software frame of the SAME luma size still re-uploads.
       // Also invalidate the colour-conditioning cache (cs/cr) — a returning software frame MUST re-set the
       // YUV→RGB uniforms even if its metadata matches the pre-WC stream (don't rely on the resize branch).
       this.w = w; this.h = h; this.cw = 0; this.ch = 0; this.bitDepth = 0; this.cs = -1; this.cr = -1; this.trc = -1;
-      this.canvas.width = w;
-      this.canvas.height = h;
-      gl.viewport(0, 0, w, h);
+      this.dispW = dispW; this.dispH = dispH;
+      // Canvas/viewport at the demuxer's display dims (anamorphic stretch via dispW); the WC texture is the
+      // (re-wrapped) visible region the caller hands us.
+      this.canvas.width = dispW;
+      this.canvas.height = dispH;
+      gl.viewport(0, 0, dispW, dispH);
     }
     gl.useProgram(this.progRgb);
     gl.activeTexture(gl.TEXTURE0 + 3);

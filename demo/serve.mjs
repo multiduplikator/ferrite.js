@@ -25,7 +25,12 @@ const MIME = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
   '.mjs': 'text/javascript', '.map': 'application/json', '.wasm': 'application/wasm',
   '.json': 'application/json', '.svg': 'image/svg+xml',
+  '.ts': 'video/mp2t', '.m2ts': 'video/mp2t', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
 };
+// VOD media served from assets/ → range-capable (the player's range AVIO issues a 0-0 size probe + on-demand
+// Range GETs; the static reply must be 206 + Content-Range + Accept-Ranges, exactly like a real VOD origin).
+const MEDIA_EXT = new Set(['.mp4', '.mov', '.mkv', '.m2ts']);
 
 function isolate(res, type) {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -166,12 +171,38 @@ const server = http.createServer(async (req, res) => {
 
     const file = resolveFile(url.pathname);
     if (!file) { res.statusCode = 404; return res.end('not found'); }
-    isolate(res, MIME[path.extname(file)] || 'application/octet-stream');
+    const ext = path.extname(file);
+    isolate(res, MIME[ext] || 'application/octet-stream');
     // Dev-loop cache discipline: dist/ + demo/ change every build, so NEVER let the browser cache them
     // (a stale dist/worker.js silently runs old code → fake "fix didn't work" results). The engine
     // (assets/, ferrite.{mjs,wasm}) stays cacheable (compile-warm perf — do NOT no-store it).
     if (file.includes(`${path.sep}dist${path.sep}`) || file.includes(`${path.sep}demo${path.sep}`)) {
       res.setHeader('Cache-Control', 'no-store');
+    }
+    // VOD media → honour HTTP Range (a 206 byte-slice) so the player's range AVIO can size-probe + seek;
+    // advertise Accept-Ranges on the full reply too. Streamed (not whole-file-read) so a 100 MB MKV doesn't
+    // buffer into memory per request.
+    if (MEDIA_EXT.has(ext)) {
+      const size = statSync(file).size;
+      res.setHeader('Accept-Ranges', 'bytes');
+      const range = req.headers['range'];
+      const mm = range && /^bytes=(\d*)-(\d*)$/.exec(range);
+      if (mm) {
+        let start = mm[1] === '' ? NaN : parseInt(mm[1], 10);
+        let end = mm[2] === '' ? size - 1 : parseInt(mm[2], 10);
+        if (Number.isNaN(start)) { start = size - end; end = size - 1; } // suffix range (bytes=-N)
+        if (start > end || start < 0 || end >= size) { res.statusCode = 416; res.setHeader('Content-Range', `bytes */${size}`); return res.end(); }
+        res.statusCode = 206;
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${size}`);
+        res.setHeader('Content-Length', end - start + 1);
+        const s = createReadStream(file, { start, end });
+        res.on('close', () => s.destroy());
+        return s.pipe(res);
+      }
+      res.setHeader('Content-Length', size);
+      const s = createReadStream(file);
+      res.on('close', () => s.destroy());
+      return s.pipe(res);
     }
     res.end(await readFile(file));
   } catch (err) {
