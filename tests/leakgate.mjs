@@ -90,7 +90,17 @@ bus.addProvider(() => {
     latencyToLive: 0,     // STUBBED (no live ingest)
     // stalls / reconnects are cumulative inc()-counters (0 on the clean path)
     openVideoFrames: 0,   // software tier: no WebCodecs frames
-    workers: THREADS,     // the engine's pthread pool (decode workers) — alive for the whole session
+    // The engine's pthread pool (decode workers) for THIS engine-side gate — alive for the whole session.
+    // NB (Stage 5): this gate drives ONE loadFerrite + a demux→decode loop directly in node; it does NOT spawn
+    // the facade's Worker realms (now FOUR: demux/video/present/audio), so the Stage-5 split (the new DEMUX
+    // realm + the video packet ring) does NOT change this baseline — `workers` here is the engine pthread pool
+    // (= THREADS), not a count of facade Worker instances (getStats().workers === 4 in the browser). The new
+    // realm's reap is covered by the browser Leak-test button (full-realm) + the facade's shutdownDemux
+    // handshake (index.ts), not this headless gate. The gate exercises the SAME engine FFIs (demux/vdec) the
+    // split workers use; the new ferrite_vdec_new_with_extradata FFI is NOT exercised here (the gate uses
+    // vdecNew/vdecNewFromDemux directly), so the gate runs unchanged against the CURRENT assets/ferrite.wasm —
+    // a rebuild is needed only for the browser facade's VOD video path to apply the relayed avcC/hvcC.
+    workers: THREADS,
     audioContexts: 0,     // no audio playout in the engine gate
     connections: 0,       // STUBBED (file fixture, no live ingest)
   };

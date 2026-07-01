@@ -248,10 +248,13 @@ export function attachControls(
   const rQueue = row('decode q');    // tier-specific backlog: WC VideoDecoder queue / SW credits
   const rIngest = row('ingest');     // network throughput + buffered bytes (network- vs decode-stall)
   const rFetch = row('fetch');       // VOD-only: HttpSource transport — position/total · window · conns (hidden on live)
-  const rAudio = row('audio');       // audio-sync state: synced/free · seg-queue · rate · stalls
+  const rAudio = row('audio');       // audio path: sync state · queue · source→output downmix · stream→ctx rate
+  const rABuf = row('a.buf');        // audio reservoir health: scheduled-ahead · drops · underruns · loudness · gain
+  const rASync = row('a.sync');      // lip-sync instruments: A/V error · latency-to-live vs the buffer target
   dbg.append(
     rIso.row, rTier.row, rFmt.row, rStatus.row, rClock.row,
-    rDecode.row, rPresent.row, rDisplay.row, rInflight.row, rQueue.row, rIngest.row, rFetch.row, rAudio.row,
+    rDecode.row, rPresent.row, rDisplay.row, rInflight.row, rQueue.row, rIngest.row, rFetch.row,
+    rAudio.row, rABuf.row, rASync.row,
   );
 
   shell.append(bar);
@@ -419,9 +422,21 @@ export function attachControls(
         `${fmtBytes(s.vodPositionBytes)}/${fmtBytes(s.vodTotalBytes)} (${pct}%) · win ${fmtBytes(s.vodWindowBytes)} · ${s.vodConnections} conn${s.vodReopens ? `/${s.vodReopens} reopen` : ''}${s.vodDegraded ? ' · deg(200)' : ''}`;
     }
 
-    // audio: master-clock sync state, scheduled-segment queue depth, live-sync rate, and stall count.
+    // audio: master-clock sync state, reservoir queue depth, the surround→stereo downmix ("6→2ch"), and the
+    // stream-vs-context sample rate ("48.0→ctx48.0k").
+    const srcCh = s.audioSrcChannels, outCh = s.audioOutChannels;
+    const chStr = srcCh > 0 && srcCh !== outCh ? `${srcCh}→${outCh}ch` : `${outCh}ch`;
     rAudio.val.textContent =
-      `${s.syncedToAudio ? 'sync' : 'free'} · q${s.audioQueue} · ${s.speed.toFixed(2)}×${s.liveSyncStalls ? ` · ${s.liveSyncStalls} stall` : ''}`;
+      `${s.syncedToAudio ? 'sync' : 'free'} · q${s.audioQueue} · ${chStr} · ${(s.audioStreamRate / 1000).toFixed(1)}→ctx${(s.audioCtxRate / 1000).toFixed(1)}k`;
+    // a.buf: reservoir health — scheduled-ahead depth, cap drops, underruns, measured loudness + applied makeup
+    // gain. loudness shows "—" before the integrator seeds (silence / startup, where the proxy reads ≥ 0).
+    const loudStr = s.audioLoudnessDb < 0 ? s.audioLoudnessDb.toFixed(1) : '—';
+    const gain = s.audioGainDb;
+    rABuf.val.textContent =
+      `ahead ${s.latencyToLive.toFixed(2)}s · drops ${s.audioDrops} · under ${s.audioUnderruns} · loud ${loudStr}dB · gain ${gain >= 0 ? '+' : ''}${gain.toFixed(1)}dB`;
+    // a.sync: lip-sync — heard-audio vs displayed-video error (− = video leads), and latency-to-live vs target.
+    rASync.val.textContent =
+      `av ${s.avDiffMs >= 0 ? '+' : ''}${s.avDiffMs.toFixed(0)}ms · lat ${s.latencyToLive.toFixed(2)}/${s.targetLatency.toFixed(2)}s`;
   };
   syncBar();
   const syncTimer = setInterval(() => { syncBar(); syncSeek(); syncDebug(); }, 250);

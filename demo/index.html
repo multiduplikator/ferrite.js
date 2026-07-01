@@ -16,7 +16,7 @@
     #wrap { padding: 16px; max-width: 980px; }
     canvas { width: 100%; background: #000; display: block; border-radius: 6px; }
     #status { margin-top: 12px; color: #9cdcfe; font: 13px/1.5 ui-monospace, monospace; }
-    #out { margin-top: 10px; padding: 8px 12px; white-space: pre-wrap; color: #6a9955;
+    #bench-out { margin-top: 10px; padding: 8px 12px; white-space: pre-wrap; color: #6a9955;
       font: 12px/1.5 ui-monospace, monospace; background: #0f1115; border: 1px solid #2b2f38;
       border-radius: 4px; min-height: 1.5em; max-height: 220px; overflow: auto; }
   </style>
@@ -31,7 +31,8 @@
     <select id="fixture">
       <optgroup label="capability matrix — TS (live)">
         <option value="cap_ts_hevc2160_10hlg_eac3.ts">TS · HEVC 2160p50 · 10-bit HLG · EAC3 5.1 (hev1 · HDR · downmix)</option>
-        <option value="cap_ts_h264_1080i_ac3.ts">TS · H264 1080i · AC3 (interlaced · deint)</option>
+        <option value="cap_ts_h264_1080i_ac3.ts">TS · H264 1080i · AC3 (interlaced · deint · software)</option>
+        <option value="cap_ts_h264_1080p_aac.ts">TS · H264 1080p · AAC (progressive · WebCodecs)</option>
         <option value="cap_ts_mpeg2_1080i_mp2.ts">TS · MPEG-2 1080i · MP2 (broadcast)</option>
         <option value="cap_ts_h264_2160_noaudio.ts">TS · H264 2160p50 · no audio</option>
         <option value="cap_aspect_h264_1440x1080.ts">TS · anamorphic 1440×1080 → 16:9 · H.264 · AAC (circle)</option>
@@ -52,20 +53,28 @@
   <div id="wrap">
     <canvas id="screen" width="1280" height="720"></canvas>
     <div id="status">idle</div>
-    <pre id="out"></pre>
+    <pre id="bench-out"></pre>
   </div>
 
   <script type="module">
     // Drives the public ferrite.js facade exactly the way an mpegts.js consumer would, plus the optional
     // built-in controls/debug overlay from the `ferrite.js/controls` subpath. Provides a Benchmark and a
     // Leak-test button.
-    import Ferrite, { Events } from '/dist/index.js';
+    import Ferrite, { Events, initHostAudio, hostAudioCtx } from '/dist/index.js';
     import { attachControls } from '/dist/controls.js';
+
+    // Host-owned AudioContext (the reference-player pattern): one app-lifetime ctx, unlocked on the first
+    // user gesture + recovered across interrupts (iOS audio auto-start). Created once at load (suspended);
+    // each player ATTACHES to it via attachAudio() before play(), so the player never creates/closes it.
+    // On desktop the standalone own-ctx + resume-on-play path also works; this is the iOS-correct path.
+    try { initHostAudio(); } catch { /* no AudioContext (non-isolated / SSR) — player falls back to its own */ }
 
     const $ = (id) => document.getElementById(id);
     const setStatus = (m) => { $('status').textContent = m; };
-    const out = (line) => { $('out').textContent += line + '\n'; $('out').scrollTop = $('out').scrollHeight; };
-    const clearOut = () => { $('out').textContent = ''; };
+    // Benchmark / leak-test result box (bench-out). Player LOG/MEDIA_INFO/ERROR go to the console + status line
+    // (not mirrored on-screen) — the debug overlay (long-press the video) is the in-page diagnostic surface.
+    const out = (line) => { $('bench-out').textContent += line + '\n'; $('bench-out').scrollTop = $('bench-out').scrollHeight; };
+    const clearOut = () => { $('bench-out').textContent = ''; };
 
     // The standalone demo IS the observability harness → getStats()→/buildlog ~1 Hz while playing
     // (server-readable telemetry; ?debug=0 silences). decode pthread pool = host-adaptive (hc−2, 2..8).
@@ -82,7 +91,7 @@
     // a same-origin path → pass through; a cross-origin http(s) URL → bridge through /proxy (COEP).
     function resolveUrl() {
       const raw = $('url').value.trim();
-      if (!raw) return isVodFixture() ? `/assets/${fixture()}` : `/faux-live?file=assets/${fixture()}`;
+      if (!raw) return isVodFixture() ? `/assets/${fixture()}` : `/faux-live?file=assets/${fixture()}&continuous=1`;
       if (raw.startsWith('/')) return raw;
       let u; try { u = new URL(raw, location.href); } catch { return raw; }
       if (u.origin === location.origin) return raw;
@@ -113,9 +122,10 @@
 
       player = Ferrite.createPlayer({ type: 'mpegts', isLive, url },
         { wasmBaseUrl: '/assets/', threads: 'auto' });
-      player.on(Events.LOG, (m) => out('· ' + m));
-      player.on(Events.MEDIA_INFO, (i) => out(`media: ${i.videoCodec} ${i.width}x${i.height} / ${i.audioCodec}`));
-      player.on(Events.ERROR, (type, details, info) => { console.error('[ferrite] ERROR', type, details, info); setStatus(`error: ${type}/${details}`); out(`✗ ERROR ${type}/${details}`); });
+      const hctx = hostAudioCtx(); if (hctx) player.attachAudio(hctx); // host-owned ctx (gesture-unlocked) — iOS auto-start
+      player.on(Events.LOG, (m) => { console.log('[ferrite]', m); try { fetch('/buildlog', { method: 'POST', body: JSON.stringify({ kind: 'log', msg: m }), keepalive: true }).catch(() => {}); } catch {} });
+      player.on(Events.MEDIA_INFO, (i) => console.log(`[ferrite] media: ${i.videoCodec} ${i.width}x${i.height} / ${i.audioCodec}`));
+      player.on(Events.ERROR, (type, details, info) => { console.error('[ferrite] ERROR', type, details, info); setStatus(`error: ${type}/${details}`); });
       player.attachCanvas(canvas);
       controls = attachControls(player, canvas);
       player.load();
@@ -157,13 +167,14 @@
       // The leak-test push-streams as faux-live (live mpegts) → use a TS fixture; fall back if a VOD one is picked.
       const tsFixture = isVodFixture() ? 'cap_ts_h264_2160_noaudio.ts' : fixture();
       out(`leak-test: ${CYCLES} cycles · ${tsFixture}`);
-      const url = `/faux-live?file=assets/${tsFixture}`;
+      const url = `/faux-live?file=assets/${tsFixture}&noloop`;
       let leaks = 0;
       for (let i = 1; i <= CYCLES; i++) {
         const old = $('screen'); old.replaceWith(old.cloneNode(false));
         const canvas = $('screen');
         const p = Ferrite.createPlayer({ type: 'mpegts', isLive: true, url },
           { wasmBaseUrl: '/assets/', threads: 'auto' });
+        const hctx = hostAudioCtx(); if (hctx) p.attachAudio(hctx); // exercise node-only host-ctx teardown across cycles
         p.attachCanvas(canvas); p.load(); await p.play();
         await sleep(PLAY_MS);
         p.pause(); p.unload(); p.detachMediaElement(); p.destroy();

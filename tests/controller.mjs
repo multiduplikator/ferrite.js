@@ -30,9 +30,8 @@ test('initial state is idle/live', () => {
 test('idle --load--> opening emits openSource + presentReset + feedGate(open)', () => {
   const r = reduce(initialState(), { type: 'load', mode: 'live', url: '/faux-live' });
   assert.equal(r.state.name, 'opening');
-  assert.equal(r.state.url, '/faux-live');
+  assert.equal(r.state.url, '/faux-live'); // the url lands on the STATE; openSource is payloadless (read off the state)
   assert.deepEqual(cmds(r), ['openSource', 'presentReset', 'feedGate']);
-  assert.equal(r.commands[0].url, '/faux-live');
   assert.equal(r.commands[2].open, true);
 });
 
@@ -52,7 +51,7 @@ test('opened → buffering emits startDecode', () => {
   assert.deepEqual(cmds(r), ['startDecode']);
 });
 
-test('playing ⇄ paused (pause closes the gate, live resume re-anchors)', () => {
+test('playing ⇄ paused (pause closes the gate; resume re-opens it — play() re-anchors live imperatively)', () => {
   let s = drive([{ type: 'load', mode: 'live', url: 'u' }, { type: 'opened' }, { type: 'lowWater' }]).state;
   const pause = reduce(s, { type: 'userPause' });
   assert.equal(pause.state.name, 'paused');
@@ -60,7 +59,9 @@ test('playing ⇄ paused (pause closes the gate, live resume re-anchors)', () =>
   assert.equal(pause.commands[0].open, false);
   const play = reduce(pause.state, { type: 'userPlay' });
   assert.equal(play.state.name, 'playing');
-  assert.deepEqual(cmds(play), ['presentReset', 'feedGate']); // live resume seeks the edge first
+  // Resume just re-opens the gate; the live-edge re-anchor is done imperatively by play() (not the reducer),
+  // so live and vod resume emit the same command (no double-run of the present reset).
+  assert.deepEqual(cmds(play), ['feedGate']);
 });
 
 test('vod resume continues in place (no presentReset)', () => {
@@ -301,6 +302,44 @@ test('a redundant reconnect while reconnecting is inert (no new commands)', () =
   const r = reduce(s, { type: 'reconnect' });
   assert.equal(r.state.name, 'reconnecting');
   assert.equal(r.commands.length, 0);
+});
+
+// ---- Eof state + the global Load/Eof rules (mpv combined-EOF gate; mirrors playback.rs tests) ----------
+const playing = () => drive([{ type: 'load', mode: 'live', url: 'u' }, { type: 'opened' }, { type: 'lowWater' }]).state;
+
+test('eof from playing → eof, emits ended exactly once', () => {
+  const r = reduce(playing(), { type: 'eof' });
+  assert.equal(r.state.name, 'eof');
+  assert.deepEqual(r.commands, [{ type: 'emit', event: 'ended' }]);
+  // a SECOND eof (the other of decode/demux ended) is inert — the host is told exactly once.
+  const r2 = reduce(r.state, { type: 'eof' });
+  assert.equal(r2.state.name, 'eof');
+  assert.equal(r2.commands.length, 0);
+});
+
+test('eof reachable while paused', () => {
+  const s = reduce(playing(), { type: 'userPause' }).state;
+  assert.equal(s.name, 'paused');
+  const r = reduce(s, { type: 'eof' });
+  assert.equal(r.state.name, 'eof');
+  assert.deepEqual(cmds(r), ['emit']);
+});
+
+test('a fresh load restarts the lifecycle from eof AND from playing (global Load rule)', () => {
+  const fromEof = reduce(reduce(playing(), { type: 'eof' }).state, { type: 'load', mode: 'live', url: 'u2' });
+  assert.equal(fromEof.state.name, 'opening');
+  assert.deepEqual(cmds(fromEof), ['openSource', 'presentReset', 'feedGate']);
+  // a channel-zap re-load straight from Playing also restarts (was idle-only before).
+  assert.equal(reduce(playing(), { type: 'load', mode: 'live', url: 'u2' }).state.name, 'opening');
+});
+
+test('eof then destroy tears down; eof during teardown is inert', () => {
+  const r = reduce(reduce(playing(), { type: 'eof' }).state, { type: 'userDestroy' });
+  assert.equal(r.state.name, 'closing');
+  assert.equal(r.commands[0].open, false); // feedGate(false) first
+  // teardown can't be interrupted by an eof
+  const c = drive([{ type: 'load', mode: 'live', url: 'u' }, { type: 'opened' }, { type: 'lowWater' }, { type: 'userDestroy' }]).state;
+  assert.equal(reduce(c, { type: 'eof' }).state.name, 'closing');
 });
 
 console.log(`\n✓ all ${passed} controller tests passed`);

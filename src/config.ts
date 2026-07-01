@@ -1,15 +1,11 @@
 // ferrite-player Config — mpegts.js vocabulary + ferrite-extension knobs.
 //
 // SCOPE NOTE: a typical host reads NONE of these — they are facade-internal config. They are
-// declared + validated + stored, and wired into the decode loop / master clock:
+// declared + validated + stored, and wired into the decode loop:
 //   adaptive low-water       → `stashInitialSize` floor + `stashMaxSize` ceiling + `stashAdaptive`
 //                              → posted on `init`; the worker sizes liveLowWater/liveReadAhead.
-//   live latency-sync        → `liveSync` + `liveSyncTargetLatency`/`liveSyncMaxLatency` +
-//                              `liveSyncPlaybackRate` (1.05, NOT liveBufferLatencyChasing) + the
-//                              ferrite-ext anti-hunt knobs (deadband/gate/sigmoid) → applied at the
-//                              AudioBufferSourceNode.playbackRate master clock (index.ts playAudio).
-// `liveBufferLatencyChasing` stays declared-OFF (the rejected discrete chaser). The pure policy fns
-// (policy.ts) read these knobs as parameters.
+// The pure policy fns (policy.ts) read these knobs as parameters. (We do NOT chase live latency by
+// changing playback rate — exactly like mpv; there is no playback-rate-chaser knob.)
 //
 // DOM-free and portable. Defaults mirror mpegts.js v1.8.0
 // (src/config.js:19-61) EXCEPT where ferrite intentionally diverges (noted inline).
@@ -19,11 +15,21 @@ export interface FerriteConfig {
   /** Base URL serving ferrite.mjs + ferrite.wasm (same-origin, COOP/COEP). */
   wasmBaseUrl: string;
   /** Override the decode-worker URL. Defaults to the `worker.js` shipped beside this module
-   *  (resolved via `import.meta.url`). Set this only for an unusual asset layout or a strict CSP. */
+   *  (resolved via `import.meta.url`). Set this only for an unusual asset layout or a strict CSP.
+   *  MUST resolve to an ES-MODULE worker: the workers are spawned `{ type: 'module' }`, which buffers
+   *  messages posted before `onmessage` is installed — the player relies on that to deliver each worker's
+   *  `init` (carrying transferred SABs / the OffscreenCanvas / the MessagePort) without a ready-handshake.
+   *  A classic (non-module) worker would DROP those pre-`onmessage` posts. (Same applies to the URLs below.) */
   workerUrl?: string | URL;
   /** Override the present-worker URL (the split-realm OffscreenCanvas presenter). Defaults to the
    *  `present-worker.js` shipped beside this module. Set only for an unusual asset layout / strict CSP. */
   presentWorkerUrl?: string | URL;
+  /** Override the audio-worker URL (the split-realm audio decode + PCM-ring producer). Defaults to the
+   *  `audio-worker.js` shipped beside this module. Set only for an unusual asset layout / strict CSP. */
+  audioWorkerUrl?: string | URL;
+  /** Override the demux-worker URL (the split-realm ingest/source/demux + both ring producers).
+   *  Defaults to the `demux-worker.js` shipped beside this module. Set only for an unusual asset layout / strict CSP. */
+  demuxWorkerUrl?: string | URL;
   /** SW FFmpeg decoder thread count (frame+slice threads). `'auto'` (the default) is the
    *  host-adaptive resolution `clamp(navigator.hardwareConcurrency − 2, 2, 8)` — resolved at the
    *  player-creation boundary (index.ts, where `navigator` is reliable) via {@link resolveThreadCount}.
@@ -31,6 +37,10 @@ export interface FerriteConfig {
   threads: number | 'auto';
   /** Prefer hardware WebCodecs for codecs it supports. */
   preferWebCodecs: boolean;
+  /** Allow non-spec-compliant software-decode speedups (mpv --vd-lavc-fast / AV_CODEC_FLAG2_FAST): a small
+   *  throughput win that steadies the cadence on decode-bound software 4K, at a slight quality tradeoff.
+   *  Software tier only (the WebCodecs path is unaffected). OFF by default. */
+  fastDecode: boolean;
   /** Override the WebCodecs present-ring cap (in-flight VideoFrame budget).
    *  undefined ⇒ platform default (iOS tight ~24 to bound pinned GPU surfaces, desktop deep ~120 for
    *  burst smoothing). Set to tune the iPad-wedge triage; floored at 4. Software tier is unaffected. */
@@ -57,34 +67,10 @@ export interface FerriteConfig {
   stashAdaptive: boolean;
 
   // --- mpegts live ---
-  /** Live stream (no seekable end). Gates live latency-sync + the early-EOF-vs-clean-end decision. */
+  /** Live stream (no seekable end). Gates the early-EOF-vs-clean-end decision.
+   *  (We do NOT chase live latency by changing playback rate — exactly like mpv; there is no
+   *  playback-rate-chaser knob.) */
   isLive: boolean;
-
-  // --- live latency-sync via playback-rate (hls.js latency-controller flavor) ---
-  /** master enable (continuous-rate sync). Set true for live. */
-  liveSync: boolean;
-  /** TARGET latency (s). Ferrite default 0.6 (mpegts default 0.8). */
-  liveSyncTargetLatency: number;
-  /** relax ceiling (s) — the liveSyncOnStallIncrease cap. MUST be > target (validated). */
-  liveSyncMaxLatency: number;
-  /** MAX_RATE. Ferrite uses 1.05 for sub-audible pitch (mpegts default 1.2 — overridden). */
-  liveSyncPlaybackRate: number;
-
-  // --- mpegts liveBufferLatencyChasing: the DISCRETE seek-to-edge chaser. ---
-  // The continuous-rate sync deliberately does NOT use this (it's the 3-state jump that hunts/stutters).
-  // Declared for spec parity; left OFF. Continuous-rate (liveSync*) is used instead.
-  liveBufferLatencyChasing: boolean;
-  liveBufferLatencyChasingOnPaused: boolean;
-  liveBufferLatencyMaxLatency: number;
-  liveBufferLatencyMinRemain: number;
-
-  // --- ferrite-ext live latency-sync anti-hunt machinery (no mpegts equivalent) ---
-  /** Dead-band (s): no rate nudge while |latency−target| ≤ this. Raise if it hunts. */
-  liveSyncDeadbandSecs: number;
-  /** Gate (s): only speed up while forward-buffer > this (underrun guard). */
-  liveSyncGateSecs: number;
-  /** Sigmoid steepness for the rate curve `2/(1+e^(−k·d))`. */
-  liveSyncSigmoidSteepness: number;
 }
 
 /** Defaults. mpegts-derived where applicable; ferrite divergences flagged in the interface. */
@@ -92,6 +78,7 @@ export const defaultConfig: FerriteConfig = {
   wasmBaseUrl: '/',
   threads: 'auto', // host-adaptive clamp(hardwareConcurrency − 2, 2, 8); see resolveThreadCount
   preferWebCodecs: true,
+  fastDecode: false, // OFF: spec-compliant decode by default (opt-in perf lever for decode-bound SW 4K)
   wcPresentRingCap: undefined, // platform default (iOS tight / desktop deep)
 
   // SW present/decode coupling is in-order credit-coupled (no-drop → a CONTIGUOUS present ring → continuous
@@ -104,20 +91,6 @@ export const defaultConfig: FerriteConfig = {
   stashAdaptive: true,
 
   isLive: false,
-
-  liveSync: false,
-  liveSyncTargetLatency: 0.6,
-  liveSyncMaxLatency: 1.2,
-  liveSyncPlaybackRate: 1.05,
-
-  liveBufferLatencyChasing: false,
-  liveBufferLatencyChasingOnPaused: false,
-  liveBufferLatencyMaxLatency: 1.5,
-  liveBufferLatencyMinRemain: 0.5,
-
-  liveSyncDeadbandSecs: 0.05,
-  liveSyncGateSecs: 0.5,
-  liveSyncSigmoidSteepness: 0.75,
 };
 
 /**
@@ -148,13 +121,6 @@ export function validateConfig(cfg: FerriteConfig): void {
   if (!Number.isFinite(cfg.stashMaxSize) || cfg.stashMaxSize <= 0) fail('stashMaxSize must be > 0');
   if (cfg.stashInitialSize !== undefined && cfg.stashInitialSize > cfg.stashMaxSize)
     fail('stashInitialSize (floor) must be ≤ stashMaxSize (ceiling)');
-  // hls.js graft: the relax ceiling must sit above the target, else latency-sync is incoherent.
-  if (cfg.liveSyncMaxLatency <= cfg.liveSyncTargetLatency)
-    fail('liveSyncMaxLatency must be > liveSyncTargetLatency');
-  if (cfg.liveSyncPlaybackRate < 1.0) fail('liveSyncPlaybackRate must be ≥ 1.0');
-  if (cfg.liveSyncTargetLatency < 0) fail('liveSyncTargetLatency must be ≥ 0');
-  if (cfg.liveSyncDeadbandSecs < 0) fail('liveSyncDeadbandSecs must be ≥ 0');
-  if (cfg.liveSyncGateSecs < 0) fail('liveSyncGateSecs must be ≥ 0');
 }
 
 // --- host-adaptive decode threads --------------------------------------------------------------

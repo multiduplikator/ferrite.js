@@ -9,6 +9,13 @@
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavcodec/bsf.h>          // extract_extradata BSF — live param-set resolution
+// FFmpeg-INTERNAL muxer helpers (libavformat source tree; build-engine.sh's -I$FFSRC makes them resolve).
+// These are the SAME functions the mov muxer uses to turn live Annex-B into the strict WebCodecs form
+// (out-of-band config record + length-prefixed NALs) — no hand-rolled NAL work. The box-writers (avc.o/
+// hevc.o) are compiled by the iso_writer CONFIG_EXTRA, pulled in via --enable-muxer=flv in build-engine.sh.
+#include "libavformat/avc.h"         // ff_isom_write_avcc — H.264 avcC config record from Annex-B SPS/PPS
+#include "libavformat/hevc.h"        // ff_isom_write_hvcc + ff_hevc_annexb2mp4_buf — HEVC hvcC + AU reframe
+#include "libavformat/nal.h"         // ff_nal_parse_units_buf — generic Annex-B→length-prefixed AU reframe
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>           // av_opt_set_double — swresample downmix center-mix-level override
@@ -408,6 +415,71 @@ static void streaming_capture_extradata(RDDemux* d) {
 // the param sets directly (e.g. building a WebCodecs config).
 const uint8_t* ferrite_demux_v_extradata(RDDemux* d)  { return (d && d->vstream >= 0 && d->fmt) ? d->fmt->streams[d->vstream]->codecpar->extradata      : 0; }
 int            ferrite_demux_v_extradata_size(RDDemux* d) { return (d && d->vstream >= 0 && d->fmt) ? d->fmt->streams[d->vstream]->codecpar->extradata_size : 0; }
+// AUDIO extradata (AudioSpecificConfig for raw AAC, etc.) — the decode-split audio worker needs it to build
+// its decoder (audio_new_with_extradata) since it has no demux handle. Empty for self-describing mpegts ADTS.
+const uint8_t* ferrite_demux_a_extradata(RDDemux* d)  { return (d && d->astream >= 0 && d->fmt) ? d->fmt->streams[d->astream]->codecpar->extradata      : 0; }
+int            ferrite_demux_a_extradata_size(RDDemux* d) { return (d && d->astream >= 0 && d->fmt) ? d->fmt->streams[d->astream]->codecpar->extradata_size : 0; }
+
+// ===================== WebCodecs strict-form helpers (live → VOD parity) =====================
+// Live mpegts delivers Annex-B (start-code NALs) with IN-BAND param sets; a WebCodecs decoder configured
+// WITH a `description` (hvcC/avcC config record) instead wants the OUT-OF-BAND + LENGTH-PREFIXED form that a
+// VOD MP4/MKV container already provides. Apple/Safari only reliably decode HEVC in that strict form, and
+// Chrome accepts it too — so converting live onto it fixes the iPad HEVC path while keeping every other
+// browser working. These reuse FFmpeg's OWN muxer helpers (the mov muxer calls the identical functions in
+// movenc.c) — no hand-rolled NAL parsing:
+//   * config record: ff_isom_write_hvcc (HEVC) / ff_isom_write_avcc (H.264), from the Annex-B extradata
+//   * per-AU reframe: ff_hevc_annexb2mp4_buf (HEVC) / ff_nal_parse_units_buf (H.264; generic, codec-agnostic)
+// The output buffers are THREAD-LOCAL: these run only on the single decode worker, and emscripten pthreads
+// share wasm globals, so a plain static would race the demux worker. The decode worker copies each result
+// out immediately (the next call frees it), mirroring how the mov muxer frees its reformatted_data per packet.
+static _Thread_local uint8_t* wc_cfg_buf = NULL;   // hvcC/avcC config record (the WebCodecs `description`)
+static _Thread_local int      wc_cfg_size = 0;
+static _Thread_local uint8_t* wc_au_buf = NULL;    // one length-prefixed access unit
+static _Thread_local int      wc_au_size = 0;
+
+// Build the WebCodecs `description` (hvcC/avcC) from Annex-B VPS/SPS/PPS extradata, via the movenc.c pattern
+// (open dyn buf → ff_isom_write_{hvcc,avcc} → close). codec_id = AV_CODEC_ID_HEVC / AV_CODEC_ID_H264.
+// Returns the config-record size (0 on failure / unsupported codec); the bytes are at ferrite_wc_config_ptr.
+int ferrite_wc_build_config(const uint8_t* annexb, int annexb_size, int codec_id) {
+    wc_cfg_size = 0;
+    av_freep(&wc_cfg_buf);                                   // drop the previous record
+    if (!annexb || annexb_size <= 0) return 0;
+    AVIOContext* pb = NULL;
+    if (avio_open_dyn_buf(&pb) < 0) return 0;
+    int ret;
+    if (codec_id == AV_CODEC_ID_HEVC)      ret = ff_isom_write_hvcc(pb, annexb, annexb_size, 0, NULL);
+    else if (codec_id == AV_CODEC_ID_H264) ret = ff_isom_write_avcc(pb, annexb, annexb_size);
+    else                                   ret = -1;
+    uint8_t* out = NULL;
+    int sz = avio_close_dyn_buf(pb, &out);                   // always drains+frees the dyn buf
+    if (ret < 0 || sz <= 0) { av_free(out); return 0; }
+    wc_cfg_buf = out;                                        // own it (av_malloc'd) — freed on the next build
+    wc_cfg_size = sz;
+    return sz;
+}
+const uint8_t* ferrite_wc_config_ptr(void) { return wc_cfg_buf; }
+
+// Reframe ONE Annex-B access unit → length-prefixed (4-byte) NALs (the form WebCodecs wants once a
+// `description` is set). filter_ps=0 keeps every NAL (in-band param sets are redundant-but-valid, and a
+// mid-stream param-set refresh must survive). codec_id selects the matching helper. Returns the reframed
+// size (0 on failure); the bytes are at ferrite_wc_au_ptr. The decode worker copies them out before the
+// next call (which frees this buffer).
+int ferrite_wc_reframe_au(const uint8_t* in, int in_size, int codec_id) {
+    wc_au_size = 0;
+    av_freep(&wc_au_buf);
+    if (!in || in_size <= 0) return 0;
+    uint8_t* out = NULL;
+    int sz = in_size;                                        // ff_*_buf: *size is IN (input) then OUT (output)
+    int ret;
+    if (codec_id == AV_CODEC_ID_HEVC)      ret = ff_hevc_annexb2mp4_buf(in, &out, &sz, 0, NULL);
+    else if (codec_id == AV_CODEC_ID_H264) ret = ff_nal_parse_units_buf(in, &out, &sz);
+    else                                   return 0;
+    if (ret < 0 || sz <= 0) { av_free(out); return 0; }
+    wc_au_buf = out;
+    wc_au_size = sz;
+    return sz;
+}
+const uint8_t* ferrite_wc_au_ptr(void) { return wc_au_buf; }
 
 // Drop the captured video extradata and re-arm the BSF — call on a mid-stream codec change so the NEW
 // codec resolves its OWN param sets instead of inheriting the previous codec's (stale) extradata.
@@ -452,6 +524,68 @@ int ferrite_demux_pkt_stream(RDDemux* d) {
 }
 const uint8_t* ferrite_demux_pkt_data(RDDemux* d) { return d->pkt->data; }
 uint32_t       ferrite_demux_pkt_size(RDDemux* d) { return (uint32_t)d->pkt->size; }
+
+// HEVC picture-NAL classification → the bit set the decode-worker reads. bit0 is_idr (NAL 19/20),
+// bit1 is_cra (21), bit2 is_rasl (8/9), bit3 is_irap (16..23). RADL (6/7) is
+// deliberately NOT flagged (leading but decodable from the IRAP — must be kept). The blunt AV_PKT_FLAG_KEY can't
+// say IDR-vs-CRA or mark RASL; these let the worker do the universal RASL-skip + CRA random-access recovery.
+static inline uint32_t hevc_pic_nal_class(int t) {
+    uint32_t f = 0;
+    if (t == 19 || t == 20)  f |= 1u << 0; // IDR (IDR_W_RADL / IDR_N_LP) — closed-GOP, no associated RASL
+    if (t == 21)             f |= 1u << 1; // CRA — open-GOP, may carry RASL/RADL
+    if (t == 8  || t == 9)   f |= 1u << 2; // RASL (RASL_N / RASL_R) — leading, undecodable from the IRAP
+    if (t >= 16 && t <= 23)  f |= 1u << 3; // IRAP range (BLA/IDR/CRA + reserved VCL)
+    return f;
+}
+
+// Classify the CURRENT video packet's picture type (HEVC only). Returns the hevc_pic_nal_class bitfield, or 0
+// when not HEVC / not a video packet / unparsable — so a scan failure degrades cleanly to today's blunt
+// is_key behaviour, never worse. Framing is AUTO-DETECTED per packet (robust across live mpegts Annex-B AND
+// VOD MP4/MKV length-prefixed AND whole-file .ts fixtures): an 00 00 01 / 00 00 00 01 head is
+// Annex-B, otherwise length-prefixed (nal_length_size read from the hvcC extradata, default 4). We classify the
+// FIRST VCL NAL (type 0..31 = the picture type); non-VCL NALs (VPS/SPS/PPS/AUD ≥ 32) are skipped.
+uint32_t ferrite_demux_pkt_nal_flags(RDDemux* d) {
+    if (!d || !d->pkt || !d->fmt || d->vstream < 0) return 0;
+    if (d->pkt->stream_index != d->vstream) return 0;
+    AVCodecParameters* par = d->fmt->streams[d->vstream]->codecpar;
+    if (!par || par->codec_id != AV_CODEC_ID_HEVC) return 0; // RASL/CRA are HEVC-only
+    const uint8_t* p = d->pkt->data;
+    int n = d->pkt->size;
+    if (!p || n < 4) return 0;
+
+    int annexb = (p[0] == 0 && p[1] == 0 && (p[2] == 1 || (p[2] == 0 && p[3] == 1)));
+    if (annexb) {
+        int i = 0;
+        while (i + 4 <= n) {
+            if (p[i] == 0 && p[i + 1] == 0 && (p[i + 2] == 1 || (p[i + 2] == 0 && p[i + 3] == 1))) {
+                int sc = (p[i + 2] == 1) ? 3 : 4; // 3- or 4-byte start code
+                int h = i + sc;                   // NAL header byte
+                if (h >= n) break;
+                int t = (p[h] >> 1) & 0x3F;       // HEVC: type = bits 1..6 of the first header byte
+                if (t <= 31) return hevc_pic_nal_class(t); // first VCL NAL → the picture type
+                i = h + 2;                        // skip this non-VCL NAL's 2-byte header, keep scanning
+            } else {
+                i++;
+            }
+        }
+        return 0;
+    }
+    // Length-prefixed (MP4/MKV): [length:nls][nal …]. nls from the hvcC (extradata[21] & 3) + 1, default 4.
+    int nls = 4;
+    if (par->extradata && par->extradata_size > 22) nls = (par->extradata[21] & 0x3) + 1;
+    int i = 0;
+    while (i + nls < n) {
+        uint32_t len = 0;
+        for (int k = 0; k < nls; k++) len = (len << 8) | p[i + k];
+        int h = i + nls; // NAL header byte
+        if (len == 0 || h + 1 >= n || (int64_t)h + (int64_t)len > n) break; // malformed → bail (return 0)
+        int t = (p[h] >> 1) & 0x3F;
+        if (t <= 31) return hevc_pic_nal_class(t); // first VCL NAL → the picture type
+        i = h + (int)len;
+    }
+    return 0;
+}
+
 static int64_t to_us(RDDemux* d, int64_t ts) {
     if (ts == AV_NOPTS_VALUE) return INT64_MIN;
     AVRational tb = d->fmt->streams[d->pkt->stream_index]->time_base;
@@ -537,6 +671,40 @@ static RDAudio* audio_open(const AVCodec* dec, AVCodecParameters* par) {
 
 RDAudio* ferrite_audio_new(int codec_id) {
     return audio_open(avcodec_find_decoder((enum AVCodecID)codec_id), NULL);
+}
+
+// Build a minimal AVCodecParameters carrying the codec id + out-of-band extradata (ASC for raw AAC). In the
+// DECODE-SPLIT VOD path the demux handle lives in a DIFFERENT engine instance than the audio decoder (the
+// audio worker has its OWN ferrite realm), so the decoder can't read codecpar from the demux — the extradata
+// bytes are shipped across the worker boundary and the par is rebuilt here, exactly like the *_from_demux
+// constructor but from raw bytes. Caller frees. (Ported from the reference player.)
+static AVCodecParameters* params_from_extradata(int codec_id, enum AVMediaType type,
+                                                const uint8_t* ed, int ed_len) {
+    AVCodecParameters* par = avcodec_parameters_alloc();
+    if (!par) return NULL;
+    par->codec_type = type;
+    par->codec_id = (enum AVCodecID)codec_id;
+    if (ed && ed_len > 0) {
+        par->extradata = (uint8_t*)av_mallocz((size_t)ed_len + AV_INPUT_BUFFER_PADDING_SIZE);
+        if (!par->extradata) { avcodec_parameters_free(&par); return NULL; }
+        memcpy(par->extradata, ed, (size_t)ed_len);
+        par->extradata_size = ed_len;
+    }
+    return par;
+}
+
+// VOD decode-split audio constructor: build a decoder from a codec id + the shipped out-of-band extradata.
+// Mirrors ferrite_audio_new_from_demux but takes raw bytes (the audio worker has no demux handle). Empty
+// extradata falls back to the bare decoder (live ADTS is self-describing). (Ported from the reference player.)
+RDAudio* ferrite_audio_new_with_extradata(int codec_id, const uint8_t* ed, int ed_len) {
+    const AVCodec* dec = avcodec_find_decoder((enum AVCodecID)codec_id);
+    if (!dec) return NULL;
+    if (!ed || ed_len <= 0) return audio_open(dec, NULL);
+    AVCodecParameters* par = params_from_extradata(codec_id, AVMEDIA_TYPE_AUDIO, ed, ed_len);
+    if (!par) return NULL;
+    RDAudio* a = audio_open(dec, par);
+    avcodec_parameters_free(&par);
+    return a;
 }
 
 /* Dyna "Night" — a feed-forward dynamic-range compressor on the FINAL interleaved-stereo PCM (post-swr, in
@@ -753,6 +921,11 @@ struct RDVdec {
 };
 #define DEINT_RETRY_BUDGET 3
 
+// FAST-decode toggle (AV_CODEC_FLAG2_FAST). Process(worker)-global: one decode worker owns one decoder, and
+// the flag must be applied at avcodec_open2 time, so the decode worker sets this before (re)creating a decoder.
+static int g_vdec_fast = 0;
+void ferrite_set_fast_decode(int on) { g_vdec_fast = on ? 1 : 0; }
+
 // Shared video open. par != NULL copies codecpar (incl. extradata) into the context — REQUIRED for
 // MP4/MKV, where H.264/HEVC NALs are LENGTH-PREFIXED (AVCC/HVCC) and the SPS/PPS/VPS live in extradata;
 // with extradata set, the decoder reads nal_length_size and parses length-prefixed packets natively.
@@ -768,6 +941,10 @@ static RDVdec* vdec_open(const AVCodec* dec, AVCodecParameters* par, int threads
         v->ctx->thread_count = threads;
         v->ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; // decoder uses what it supports
     }
+    // FAST decode (mpv --vd-lavc-fast): allow non-spec-compliant decode speedups (inexact IDCT etc.). Must be
+    // set BEFORE avcodec_open2. A quality/throughput tradeoff — OFF by default, toggled per-player via
+    // ferrite_set_fast_decode(); it noticeably steadies the cadence on decode-bound software 4K.
+    if (g_vdec_fast) v->ctx->flags2 |= AV_CODEC_FLAG2_FAST;
     if (avcodec_open2(v->ctx, dec, NULL) < 0) { ferrite_vdec_free(v); return NULL; }
     v->frame = av_frame_alloc();
     if (!v->frame) { ferrite_vdec_free(v); return NULL; }
@@ -789,6 +966,22 @@ RDVdec* ferrite_vdec_new_from_demux(RDDemux* d, int threads) {
     if (!d || !d->fmt || d->vstream < 0) return NULL;
     AVCodecParameters* par = d->fmt->streams[d->vstream]->codecpar;
     return vdec_open(avcodec_find_decoder(par->codec_id), par, threads);
+}
+
+// VOD decode-split video constructor (the 4-worker split — the VIDEO worker has its OWN ferrite realm
+// and NO demux handle, so it can't use ferrite_vdec_new_from_demux). Build the decoder from a codec id + the
+// shipped out-of-band extradata (avcC/hvcC for length-prefixed MP4/MKV NALs). Mirrors
+// ferrite_audio_new_with_extradata; empty extradata falls back to the bare decoder (live Annex-B is in-band).
+// (Ported from the reference player.)
+RDVdec* ferrite_vdec_new_with_extradata(int codec_id, const uint8_t* ed, int ed_len, int threads) {
+    const AVCodec* dec = avcodec_find_decoder((enum AVCodecID)codec_id);
+    if (!dec) return NULL;
+    if (!ed || ed_len <= 0) return vdec_open(dec, NULL, threads);
+    AVCodecParameters* par = params_from_extradata(codec_id, AVMEDIA_TYPE_VIDEO, ed, ed_len);
+    if (!par) return NULL;
+    RDVdec* v = vdec_open(dec, par, threads);
+    avcodec_parameters_free(&par);
+    return v;
 }
 
 int ferrite_vdec_push(RDVdec* v, const uint8_t* data, uint32_t len, int64_t pts_us) {
@@ -869,6 +1062,20 @@ void ferrite_vdec_set_skips(RDVdec* v, int skip_nonref, int skip_loopfilter) {
     if (!v || !v->ctx) return;
     v->ctx->skip_frame      = skip_nonref     ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
     v->ctx->skip_loop_filter = skip_loopfilter ? AVDISCARD_ALL    : AVDISCARD_DEFAULT;
+}
+
+/* Clear the decoder's reference/DPB state (avcodec_flush_buffers) WITHOUT tearing down the context — the
+ * Fix-B Live drop-to-keyframe recovery calls this after it has skipped delta AUs to the next IDR. Without
+ * the flush the decoder would still hold references to the (now-discarded) frames it never received and
+ * try to predict the post-skip IDR's followers from them → corrupt output, or a re-wedge waiting on refs
+ * that never arrive. avcodec_flush_buffers resets the DPB/decoder state but keeps the open context, so the
+ * skip controls / fast-decode flag / extradata all persist (no re-init, no codec reopen). Also drops any
+ * lazily-built deinterlace graph so bwdif's buffered field reference doesn't carry a stale field across
+ * the discontinuity — it rebuilds lazily on the next frame, exactly as on a geometry change. Null-safe. */
+void ferrite_vdec_flush(RDVdec* v) {
+    if (!v || !v->ctx) return;
+    avcodec_flush_buffers(v->ctx);
+    if (v->fg) { avfilter_graph_free(&v->fg); v->fg = NULL; }
 }
 
 int ferrite_vdec_step(RDVdec* v) {

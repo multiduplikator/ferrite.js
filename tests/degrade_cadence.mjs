@@ -1,41 +1,37 @@
-// Unit test for the PURE graceful-degradation helpers (the tier-2 FLOOR-FIX + the trigger).
+// Unit test for the PURE graceful-degradation helpers (the tier-2 FLOOR-FIX + the graduated ladder).
 // DOM-free, browser-free — the same reason cadenceStats/nextHold were factored out: the PTS-CAP decimation
-// (capAdvance: self-flooring, never below the decode rate, no L1+L2 double-decimation) + its shift/release
-// ACCOUNTING (no stranded/double-released slots) and the degrade TRIGGER hysteresis (no flap, never degrade
-// a healthy stream) are unit-testable headless, away from the OffscreenCanvas/WebGL present worker.
+// (capAdvance: self-flooring, never below the decode rate, no L1+L2 double-decimation), the demux-pressure
+// hint, and the GRADUATED, AXIS-SEPARATED degrade ladder (the climb/de-escalate state machine governed by
+// mpv check_framedrop's forward-headroom signal) are unit-testable headless, away from the present worker.
 //
-// Proves:
-//   capAdvance   — tier 1 always consumes 1 (full-rate path UNCHANGED); tier 2 caps by PTS DECIMATION:
-//                  dense frames (decode ≥ target) → skip to the target interval (the bandwidth relief),
-//                  SPARSE frames (decode < target, or a drained ring) → skip NOTHING (the FLOOR — present
-//                  never below decode); the TRUE content period keeps L1+L2 from decimating twice; never
-//                  empties the ring (always leaves ≥1 front); 0 when starved (<2).
-//   accounting   — driving a ring through repeated advances releases EVERY frame EXACTLY once (no strand,
-//                  no double-free) and never advances past the queue; the displayed front is a hand-off and
-//                  only the intermediate frames are decimation skips.
-//   demuxRingPressure— the (now WEAK-hint) decode-bound signal: ring ABOVE the latency floor OR CLIMBED ≥ the
-//                  growth delta over the trend window; drained → false.
-//   ladderStep   — the GRADUATED, AXIS-SEPARATED ladder (rung 0→1 L2 →2 +L3 →3 +L1): a present-side decode-
-//                  bound detector climbs ONE rung per settle window; rung2→3 is gated on contentFps ≥ 48 (so a
-//                  25fps stream caps at L2+L3, never the nonsense 12.5 halving); de-escalates in strict reverse
-//                  (L1→L3→L2) on sustained headroom, with slow asymmetric hysteresis (no flap); a capable
-//                  stream / present-stall (ring pinned full) NEVER degrades; the effective target halves at rung 3.
+// Mirrors the Rust `cadence.rs` #[test] cells (player-core/src/cadence.rs `mod tests`):
+//   capAdvance   — tier 1 always a single hand-off; tier 2 caps a DENSE ring to every-other (the draw relief)
+//                  but NEVER below the decode rate (a SPARSE ring shows all); never empties the ring; 0 starved.
+//   demuxRingPressure — high absolute OR a sufficient climb from the window min ⇒ pressure; drained → false.
+//   ladderStep   — the QUALITY-FIRST ladder (rung 0→1 skip-non-ref →2 +present-cap HALVE →3 +skip-deblock):
+//                  rung-1 IS mpv check_framedrop (the forward-headroom signal, debounced); the heavier rungs
+//                  climb ONE per settle window while STILL behind AND under; rung2→3 gated on contentFps ≥ 48
+//                  (slow content caps at rung 2 = skip-deblock); de-escalates in strict reverse on the
+//                  un-maskable `!fd` re-probe (fast) or throughput headroom (slow); a present-stall never trips
+//                  it; the un-halve is anti-flap-gated on decodeFps; the latch breaks via forward headroom.
+//   rung4Severe  — the drop-to-keyframe severe-deficit predicate (only at RUNG_MAX, past the severe frac).
 //
-// Run:  bun tests/degrade_cadence.mjs   (or node --experimental-strip-types, node ≥22)
+// Run:  node --experimental-strip-types tests/degrade_cadence.mjs   (node ≥22)
 
 import assert from 'node:assert/strict';
 import {
-  capAdvance, ladderStep, rungDecimation, demuxRingPressure,
+  capAdvance, ladderStep, rungDecimation, demuxRingPressure, rung4Severe,
   CADENCE_TIER_FULL, CADENCE_TIER_HALF,
-  RUNG_NONE, RUNG_L2, RUNG_L2_L3, RUNG_L2_L3_L1, RUNG_MAX,
-  LADDER_CLIMB_MS, LADDER_DROP_MS, LADDER_L1_MIN_FPS,
+  RUNG_NONE, RUNG_L2, RUNG_L2_L1, RUNG_L2_L1_L3, RUNG_MAX,
+  LADDER_CLIMB_MS, LADDER_DROP_MS, LADDER_RECOVER_MS, LADDER_L1_MIN_FPS, LADDER_MIN_CONTENT_FPS,
+  CHECK_FRAMEDROP_SUSTAIN_MS,
   DEGRADE_RING_BYTES, DEGRADE_RING_GROWTH_BYTES,
 } from '../src/worker/present-cadence.ts';
 
 let passed = 0;
 const test = (name, fn) => { fn(); passed++; console.log('  ✓ ' + name); };
 
-console.log('PTS-cap decimation (tier-2 floor-fix) + graceful-degradation trigger:');
+console.log('PTS-cap decimation (tier-2 floor-fix) + graduated graceful-degradation ladder:');
 
 const US = 1000;                       // µs per ms
 const P50 = 20 * US;                   // true content period for 50 fps content (20 ms)
@@ -74,8 +70,8 @@ test('tier 2 FLOOR: decode 25 fps (= the tier target) → shows ALL (boundary fr
 test('NO DOUBLE-DECIMATION (L1+L2): L2 spaces decode at 25 fps, TRUE period stays 20 ms → cap shows all 25', () => {
   // With L2 (skip non-ref) the decoder OUTPUTS ~25 fps (40 ms apart), but the cap target uses the TRUE
   // content period (20 ms, from demux PACKET PTS — L2-independent) → target 40 ms → the 40ms-spaced L2
-  // frames are all shown. If the cap had used the L2-decimated arrival rate (40 ms) the target would be
-  // 80 ms and it would halve again to 12.5 — this asserts it does NOT.
+  // frames are all shown. If the cap had used the L2-decimated arrival rate the target would be 80 ms and it
+  // would halve again to 12.5 — this asserts it does NOT.
   const ring = ringAt(6, fps(25)); // L2 output spacing
   assert.equal(capAdvance(ring, ring[0].ptsUs, P50, CADENCE_TIER_HALF), 1, 'L1+L2 → show every L2 frame (no second halving)');
 });
@@ -141,19 +137,17 @@ test('ACCOUNTING (tier 2, dense drain): retire + skip balance, no double-free, l
 test('ACCOUNTING (tier 2, steady dense refill): ~half displayed, the rest decimation skips, all released once', () => {
   const { released, handoffs, skips, remaining, producedPts } = drainAndAccount(24, fps(50), P50, CADENCE_TIER_HALF, 24, 500);
   assert.equal(new Set(released).size, released.length, 'no double-release across 500 steps');
-  // conservation: every released PTS is < producedPts, and released+remaining == produced count.
   assert.equal(released.length + remaining, producedPts / fps(50), 'released + still-queued == total produced');
   assert.ok(Math.abs(handoffs - skips) <= 1, `hand-offs (${handoffs}) ≈ skips (${skips}) — clean every-other decimation`);
 });
 
 test('ACCOUNTING (tier 2, SPARSE steady refill = decode-bound): shows ALL, ZERO skips (the floor holds in steady state)', () => {
-  // Decode delivers 15 fps (sparse, > target apart). Even with a refill the cap must NEVER skip → present = decode.
   const { skips, handoffs, released } = drainAndAccount(8, fps(15), P50, CADENCE_TIER_HALF, 8, 500);
   assert.equal(skips, 0, 'sparse ring → no decimation ever (floor: present never below decode)');
   assert.equal(handoffs, released.length, 'every shown frame is a hand-off (nothing skipped)');
 });
 
-// ---- demuxRingPressure: the decode-bound (audio-risk) gate ----
+// ---- demuxRingPressure: the decode-bound (audio-risk) WEAK hint ----
 
 test('demuxRingPressure: drained ring (healthy / VOD-range) → NO pressure; above the latency floor → pressure', () => {
   assert.equal(demuxRingPressure(780_000, 700_000), false, 'drained ≈0.78 MB, no growth → no pressure');
@@ -163,206 +157,281 @@ test('demuxRingPressure: drained ring (healthy / VOD-range) → NO pressure; abo
 });
 
 test('demuxRingPressure: a CLIMBING ring (decode not draining) trips on the growth delta before the absolute floor', () => {
-  // climbed 0.4 → 0.4+growth: under the absolute floor but the delta alone is pressure.
   const min = 400_000;
   assert.equal(demuxRingPressure(min + DEGRADE_RING_GROWTH_BYTES - 1, min), false, 'just under the growth delta → not yet');
   assert.equal(demuxRingPressure(min + DEGRADE_RING_GROWTH_BYTES, min), true, 'climbed ≥ the growth delta from the window min → pressure');
 });
 
 // ---- ladderStep: the graduated, axis-separated escalate/de-escalate ladder ----
+//
+// The LadderInput builders mirror the Rust test helpers (under_input / headroom_input / ambiguous_input).
+// `decimation` tracks the active present-cap (content-aware: 2 only at rung ≥ RUNG_L2_L1 for fast content);
+// the present worker passes exactly this so a halved display isn't read as a permanent deficit. `decimLower`
+// is the decimation one rung down (gates the un-halve). `forwardHeadroomUs` is mpv check_framedrop's signal.
 
-const WIN = 250;                         // the ~4Hz pstats post window (ms)
-const climbWins = Math.ceil(LADDER_CLIMB_MS / WIN); // windows of sustained under to climb ONE rung
-const dropWins = Math.ceil(LADDER_DROP_MS / WIN);   // windows of sustained headroom to drop ONE rung
-const RUNG0 = { rung: RUNG_NONE, climbMs: 0, dropMs: 0 };
-
-// Base measurement window — a CAPABLE 50fps stream (present at rate, clock realtime, ring full, no pressure).
-const capable = {
-  cadenceActive: true, paused: false, haveContentPeriod: true,
-  presentFps: 49, contentFps: 50, clockRateRatio: 1.0,
-  ringLow: false, ringHealthy: true, presentRingFull: false, demuxPressure: false, dWallMs: WIN,
-};
-// A genuinely DECODE-BOUND 50fps window WITH A LOW DEMUX RING (the #2 case: media/wall 0.77×, present 32/50,
-// demux ring stayed low because the read-gate paced ingest). The present-side detector must catch this with
-// NO demux-pressure help — clockRateRatio<0.95 + the present ring draining carry it.
-const decodeBound50 = {
-  ...capable, presentFps: 32, clockRateRatio: 0.77, ringLow: true, ringHealthy: false, demuxPressure: false,
-};
-
-// The ACTIVE display decimation a window sees: the manual present-cap (forced 2) OR — manual off — the rung's
-// own L1 (2 at rung 3). The present worker passes exactly this (activeTier) so a manually-halved display isn't
-// read as a permanent deficit. Tests omit `decimation` to track the rung (manual off); set it to force manual.
-const decimFor = (inp, rung) => (inp.decimation != null ? inp.decimation : rungDecimation(rung));
-
-// Drive `state` through `n` windows of a FIXED input (decimation tracks the rung unless the input forces it).
-function run(state, inp, n) {
-  let s = state;
-  for (let i = 0; i < n; i++) s = ladderStep(s, { ...inp, decimation: decimFor(inp, s.rung) });
-  return s;
-}
-// Drive through `n` windows where the input is recomputed from the CURRENT rung (recovery / re-probe cases).
-// Records every rung transition so we can assert the escalate/de-escalate ORDER (and the no-flap property).
-function runDyn(state, inpFor, n) {
-  let s = state;
-  const path = [s.rung];
-  for (let i = 0; i < n; i++) {
-    const inp = inpFor(s.rung);
-    s = ladderStep(s, { ...inp, decimation: decimFor(inp, s.rung) });
-    if (s.rung !== path[path.length - 1]) path.push(s.rung);
-  }
-  return { state: s, path };
-}
-
-test('(vi) rungDecimation: the EFFECTIVE present target halves ONLY at rung 3 (L1 engaged there alone)', () => {
-  assert.equal(rungDecimation(RUNG_NONE), 1, 'rung 0 → full rate');
-  assert.equal(rungDecimation(RUNG_L2), 1, 'rung 1 (L2) → no display decimation');
-  assert.equal(rungDecimation(RUNG_L2_L3), 1, 'rung 2 (L2+L3) → no display decimation');
-  assert.equal(rungDecimation(RUNG_L2_L3_L1), 2, 'rung 3 (L2+L3+L1) → display halved');
-});
-
-test('(iv) a CAPABLE stream (≥0.95× realtime, present ≥85% of target) NEVER degrades — stays rung 0', () => {
-  const s = run(RUNG0, capable, 60);
-  assert.equal(s.rung, RUNG_NONE, '60 capable windows → still rung 0 (no false degrade)');
-  assert.equal(s.climbMs, 0, 'no climb streak accrues on a capable stream');
-});
-
-test('present just AT 85% of target with a realtime clock does NOT degrade (conservative boundary)', () => {
-  // present = exactly 0.85×50 = 42.5 → not < 42.5; and clock realtime + ring full → cantKeepUp false anyway.
-  const atThresh = { ...capable, presentFps: 50 * 0.85 };
-  assert.equal(run(RUNG0, atThresh, climbWins + 8).rung, RUNG_NONE, 'at the boundary the stream is not under-delivering');
-});
-
-test('(i) contentFps 50 + decode-bound with a LOW demux ring → climbs all the way to rung 3 (L2+L3+L1)', () => {
-  // Climbs 0→1→2→3, one rung per ~2.5s settle window, on the present-side detector ALONE (no demux pressure).
-  const s = run(RUNG0, decodeBound50, climbWins * 3 + 8);
-  assert.equal(s.rung, RUNG_L2_L3_L1, 'a genuinely decode-bound 50fps stream reaches the top rung (all three levers)');
-});
-
-test('(i) the climb is GRADUATED — one rung per settle window, never a jump', () => {
-  // After exactly climbWins windows we are at rung 1 (not 2/3); the ladder must not fan multiple rungs at once.
-  assert.equal(run(RUNG0, decodeBound50, climbWins).rung, RUNG_L2, 'one settle window → exactly rung 1 (L2)');
-  assert.equal(run(RUNG0, decodeBound50, climbWins).rung <= RUNG_L2, true, 'never skips a rung');
-  assert.equal(run(RUNG0, decodeBound50, climbWins * 2).rung, RUNG_L2_L3, 'two settle windows → exactly rung 2 (L2+L3)');
-  assert.equal(run({ rung: RUNG_L2_L3_L1, climbMs: 0, dropMs: 0 }, decodeBound50, climbWins * 2).rung, RUNG_L2_L3_L1,
-    'already at the top → stays (cannot climb past rung 3)');
-});
-
-test('(ii) contentFps 25 + decode-bound → climbs to rung 2 (L2+L3) and STOPS — never engages L1', () => {
-  // 4K25: the only present-cap is 25→12.5 (nonsense). The rung2→3 gate (contentFps ≥ 48) must cap it at L2+L3.
-  const db25 = { ...decodeBound50, contentFps: 25, presentFps: 15, clockRateRatio: 0.6 };
-  const s = run(RUNG0, db25, climbWins * 4 + 20); // run well past where a 50fps stream would have hit rung 3
-  assert.equal(s.rung, RUNG_L2_L3, '4K25 tops out at rung 2 (L2+L3) — the decode axis only');
-  assert.notEqual(s.rung, RUNG_L2_L3_L1, 'L1 (the nonsense 12.5 halving) is NEVER engaged below 48 fps');
-});
-
-test('(iii) a present-stall (ring PINNED FULL, no-drop back-pressure) → rung 0, never degrades', () => {
-  // A sustained PRESENT stall (GC/compositor/main-block) parks decode on the full ring → demux climbs + present
-  // fps drops on a CAPABLE stream. presentRingFull marks the climb present-caused → the detector must ignore it.
-  const stalled = {
-    ...decodeBound50, presentRingFull: true, ringLow: false, ringHealthy: false, demuxPressure: true,
+// A genuine decode-bound under-delivery window: present well below the effective target, the media clock
+// sub-realtime, the present ring draining, AND the decoder behind the master clock (fd engages).
+const underInput = (contentFps, decimation, dWall) => {
+  const target = contentFps / decimation;
+  const fp = 1e6 / contentFps;
+  return {
+    cadenceActive: true, paused: false, haveContentPeriod: true,
+    presentFps: target * 0.5,           // well under the 0.85 under-fraction
+    contentFps, decimation,
+    decodeFps: contentFps * 0.5,        // decoder under-delivering (decode-bound)
+    decimLower: 1.0,
+    clockRateRatio: 0.90,               // < LADDER_RATE_UNDER ⇒ can't keep up
+    ringLow: true, ringHealthy: false, presentRingFull: false, demuxPressure: false,
+    forwardHeadroomUs: -fp,             // decoder behind the master clock ⇒ check_framedrop engages
+    framePeriodUs: fp, dWallMs: dWall,
   };
-  const s = run(RUNG0, stalled, climbWins * 3 + 12);
-  assert.equal(s.rung, RUNG_NONE, 'a pinned-full present ring is present-caused → never a decode-deficit climb');
-  assert.equal(s.climbMs, 0, 'the guard zeroes the climb streak every window (no creeping climb)');
+};
+
+// A genuine headroom window: present at the effective target, clock realtime, ring healthy, AND the decoder
+// comfortably ahead (forward headroom 5 frames → check_framedrop releases).
+const headroomInput = (contentFps, decimation, dWall) => {
+  const target = contentFps / decimation;
+  const fp = 1e6 / contentFps;
+  return {
+    cadenceActive: true, paused: false, haveContentPeriod: true,
+    presentFps: target,                 // ≥ the 0.90 over-fraction
+    contentFps, decimation,
+    decodeFps: contentFps,              // fully recovered → sustains the un-halved rate
+    decimLower: 1.0,
+    clockRateRatio: 1.0,                // ≥ LADDER_RATE_OVER ⇒ realtime
+    ringLow: false, ringHealthy: true, presentRingFull: false, demuxPressure: false,
+    forwardHeadroomUs: 5.0 * fp,        // decoder comfortably ahead ⇒ check_framedrop releases
+    framePeriodUs: fp, dWallMs: dWall,
+  };
+};
+
+// An AMBIGUOUS window — neither under (the stream keeps up: clock realtime, ring not draining) nor headroom
+// (present is low). Must reset BOTH streaks so the ladder never creeps on transient noise.
+const ambiguousInput = (contentFps, decimation, dWall) => {
+  const fp = 1e6 / contentFps;
+  return {
+    cadenceActive: true, paused: false, haveContentPeriod: true,
+    presentFps: contentFps / decimation * 0.5, // low → not headroom
+    contentFps, decimation,
+    decodeFps: contentFps,              // decode FINE → the low present is a present-side, not a decode, deficit
+    decimLower: 1.0,
+    clockRateRatio: 1.0,                // realtime + ring not low ⇒ NOT can't-keep-up ⇒ not under
+    ringLow: false, ringHealthy: false, presentRingFull: false, demuxPressure: false,
+    forwardHeadroomUs: 5.0 * fp,        // decode is fine ⇒ no check_framedrop engage
+    framePeriodUs: fp, dWallMs: dWall,
+  };
+};
+
+const LS = (rung, climbMs = 0, dropMs = 0) => ({ rung, climbMs, dropMs });
+
+test('rungDecimation: the EFFECTIVE present target halves at rung ≥ 2 (present-cap) for FAST content only', () => {
+  // Quality-first order: the present-cap HALVE engages at rung 2 (RUNG_L2_L1) — but only for content fast
+  // enough that 25 stays watchable (≥ LADDER_L1_MIN_FPS); slow content maps that rung to skip-deblock (decim 1).
+  assert.equal(rungDecimation(RUNG_NONE, 50), 1, 'rung 0 → full rate');
+  assert.equal(rungDecimation(RUNG_L2, 50), 1, 'rung 1 (skip-non-ref) → no display decimation');
+  assert.equal(rungDecimation(RUNG_L2_L1, 50), 2, 'rung 2 (+present-cap) on fast content → display halved');
+  assert.equal(rungDecimation(RUNG_L2_L1_L3, 50), 2, 'rung 3 (+skip-deblock) stays halved');
+  assert.equal(rungDecimation(RUNG_L2_L1, 25), 1, 'rung 2 on SLOW content → no halve (maps to skip-deblock)');
+});
+
+// rung-1 (check_framedrop) engages after a SUSTAINED forward-headroom deficit (CHECK_FRAMEDROP_SUSTAIN_MS
+// debounce); the heavier rungs then climb one per LADDER_CLIMB_MS.
+test('ladder climbs one rung per window: NONE→L2 debounced, then one heavy rung per settle window', () => {
+  let s = LS(RUNG_NONE);
+  const win = 500;
+  const perRung = Math.trunc(LADDER_CLIMB_MS / win);                 // 5 windows
+  const engage = Math.ceil(CHECK_FRAMEDROP_SUSTAIN_MS / win);        // 5 windows
+  // RUNG_NONE → RUNG_L2 (check_framedrop) is debounced over CHECK_FRAMEDROP_SUSTAIN_MS.
+  for (let i = 0; i < engage - 1; i++) {
+    s = ladderStep(s, underInput(50, 1, win));
+    assert.equal(s.rung, RUNG_NONE, 'rung-1 not engaged before the sustain');
+  }
+  s = ladderStep(s, underInput(50, 1, win));
+  assert.equal(s.rung, RUNG_L2, 'check_framedrop engages rung-1 after the sustain');
+  // The HEAVY rungs climb one per LADDER_CLIMB_MS of sustained throughput deficit.
+  for (let expectRung = RUNG_L2 + 1; expectRung <= RUNG_MAX; expectRung++) {
+    for (let i = 0; i < perRung - 1; i++) {
+      s = ladderStep(s, underInput(50, 1, win));
+      assert.equal(s.rung, expectRung - 1, 'must not climb early');
+    }
+    s = ladderStep(s, underInput(50, 1, win));
+    assert.equal(s.rung, expectRung, 'one heavy rung per settle window');
+    assert.equal(s.climbMs, 0, 'fresh settle window at the new rung');
+  }
+  // At RUNG_MAX it can climb no further (decimation 2 at the top rung).
+  for (let i = 0; i < perRung * 2; i++) s = ladderStep(s, underInput(50, 2, win));
+  assert.equal(s.rung, RUNG_MAX, 'saturates at RUNG_MAX');
+});
+
+test('an ambiguous window resets the HEAVY-climb streak — no creep on transient noise', () => {
+  let s = LS(RUNG_NONE);
+  const win = 500;
+  // Engage rung-1 (debounced), then accumulate the heavy-climb streak.
+  for (let i = 0; i < Math.ceil(CHECK_FRAMEDROP_SUSTAIN_MS / win); i++) s = ladderStep(s, underInput(50, 1, win));
+  assert.equal(s.rung, RUNG_L2, 'rung-1 engaged');
+  for (let i = 0; i < 4; i++) s = ladderStep(s, underInput(50, 1, win));
+  assert.equal(s.rung, RUNG_L2);
+  assert.ok(s.climbMs > 0, 'heavy-climb streak accumulated');
+  // One ambiguous window breaks the streak.
+  s = ladderStep(s, ambiguousInput(50, 1, win));
+  assert.equal(s.climbMs, 0, 'ambiguous window resets the climb streak');
+  assert.equal(s.rung, RUNG_L2);
+  // Now it needs a FULL fresh 2500 ms to climb to L2_L1 (4 more wouldn't, proving no creep).
+  for (let i = 0; i < 4; i++) {
+    s = ladderStep(s, underInput(50, 1, win));
+    assert.equal(s.rung, RUNG_L2, 'still below the heavy-climb threshold after the reset');
+  }
+  s = ladderStep(s, underInput(50, 1, win));
+  assert.equal(s.rung, RUNG_L2_L1, 'climbs only after a full fresh settle window');
+});
+
+test('present-cap GATE: contentFps < 48 caps at rung 2 (skip-non-ref + skip-deblock) — never the 25→12.5 halve', () => {
+  let s = LS(RUNG_NONE);
+  const win = 500;
+  // 25 fps content: climbs through skip-non-ref and + (slow-content) skip-deblock but is BLOCKED at rung2→3.
+  for (let i = 0; i < 200; i++) s = ladderStep(s, underInput(25, 1, win));
+  assert.equal(s.rung, RUNG_L2_L1, 'slow content tops out at rung 2 (present-cap gated off)');
+});
+
+test('de-escalation: sustained headroom drops strictly present-cap → skip-deblock → skip-non-ref, asymmetrically', () => {
+  const win = 1000;
+  // headroomInput is comfortably ahead (forward_headroom = 5 frames → !fd), so de-escalation rides the FAST
+  // forward-headroom re-probe (LADDER_RECOVER_MS), not the slow throughput path.
+  const dropWindows = Math.ceil(LADDER_RECOVER_MS / win); // 2 windows
+  let s = LS(RUNG_MAX);
+  for (let expectRung = RUNG_MAX - 1; expectRung >= RUNG_NONE; expectRung--) {
+    // present-cap (halve) is engaged at rung ≥ 2 in the quality-first order; decimation 2 there, else 1.
+    const decim = s.rung >= RUNG_L2_L1 ? 2 : 1;
+    for (let i = 0; i < dropWindows - 1; i++) {
+      s = ladderStep(s, headroomInput(50, decim, win));
+      assert.equal(s.rung, expectRung + 1, 'must not drop before the re-probe settle');
+    }
+    s = ladderStep(s, headroomInput(50, decim, win));
+    assert.equal(s.rung, expectRung, 'drops exactly one lever in strict reverse');
+  }
+  assert.equal(s.rung, RUNG_NONE, 'fully de-escalated to the full-rate path');
+});
+
+test('decode-bound climb at a REALTIME clock: the masked-realtime case climbs on decodeFps alone', () => {
+  // 50 fps content, decoder only manages 26 fps, BUT clock realtime + ring NOT low + no demux pressure — the
+  // ONLY decode-deficit signal is decodeFps < contentFps (the clock-based cantKeepUp never trips here).
+  let s = LS(RUNG_NONE);
+  const win = 500;
+  const inp = { ...ambiguousInput(50, 1, win) };
+  inp.presentFps = 26;                 // present delivering the decoder's ~26 unique fps (judder)
+  inp.decodeFps = 26;                  // the real deficit, invisible to the clock
+  inp.forwardHeadroomUs = -inp.framePeriodUs; // …and visible to check_framedrop (decoder behind)
+  // rung-1 (check_framedrop) engages on the SUSTAINED behind-the-clock signal (debounced) …
+  for (let i = 0; i < Math.ceil(CHECK_FRAMEDROP_SUSTAIN_MS / win); i++) s = ladderStep(s, inp);
+  assert.equal(s.rung, RUNG_L2, 'check_framedrop engages on the sustained decode deficit');
+  // … and the HEAVY ladder STILL climbs at a realtime clock via the decodeFps deficit.
+  for (let i = 0; i < Math.trunc(LADDER_CLIMB_MS / win); i++) s = ladderStep(s, inp);
+  assert.equal(s.rung, RUNG_L2_L1, 'a decode deficit at a realtime clock still climbs the heavy ladder');
+});
+
+test('anti-flap: at a half rung the capped present LOOKS like headroom, but decodeFps gates the un-halve → HOLD', () => {
+  let s = LS(RUNG_L2_L1); // skip-non-ref + present-cap halve engaged
+  for (let i = 0; i < 40; i++) {
+    // Looks like throughput headroom at the HALVED target (present=25=target), clock realtime…
+    const inp = { ...headroomInput(50, 2, 1000) };
+    // …but the decoder is pinned at the box ceiling: it only JUST keeps up with the halved demand, so its
+    // FORWARD HEADROOM is small (check_framedrop stays engaged, fd) — un-halving would face a 50 fps it can't
+    // meet. A genuinely-bound decoder is NOT comfortably ahead, so the `!fd` de-escalation must NOT fire.
+    inp.decodeFps = 26;
+    inp.forwardHeadroomUs = 0.5 * inp.framePeriodUs; // just keeping up ⇒ fd stays engaged
+    inp.decimLower = 1.0;
+    s = ladderStep(s, inp);
+  }
+  assert.equal(s.rung, RUNG_L2_L1, 'holds the half rung — never un-halves into a rate the decoder can\'t meet');
+});
+
+test('a PINNED-FULL present ring (present-side stall) NEVER trips the ladder, even under decode-bound-looking input', () => {
+  let s = LS(RUNG_NONE);
+  for (let i = 0; i < 200; i++) {
+    const inp = { ...underInput(50, 1, 500), presentRingFull: true };
+    s = ladderStep(s, inp);
+  }
+  assert.equal(s.rung, RUNG_NONE, 'a present-side stall never degrades');
+});
+
+test('rung-4 severe-deficit predicate: fires ONLY at RUNG_MAX past the severe frac, never on a lower rung / unknowns', () => {
+  assert.equal(rung4Severe(RUNG_MAX, 12.5, 50), true, '¼-realtime at RUNG_MAX is severe');
+  assert.equal(rung4Severe(RUNG_MAX, 40, 50), false, '0.8× is within reach of the safe levers');
+  assert.equal(rung4Severe(RUNG_MAX, 25, 50), false, '0.5× exactly is not severe (strict <)');
+  assert.equal(rung4Severe(RUNG_L2_L1, 5, 50), false, 'a lower rung never fires rung-4');
+  assert.equal(rung4Severe(RUNG_NONE, 1, 50), false, 'rung 0 never fires rung-4');
+  assert.equal(rung4Severe(RUNG_MAX, 0, 50), false, 'decodeFps ≤ 0 (unknown) never fires');
+  assert.equal(rung4Severe(RUNG_MAX, 12.5, 0), false, 'contentFps ≤ 0 (unknown) never fires');
+});
+
+test('rung-1 RELEASE: at RUNG_L2 with the decoder comfortably ahead (!fd) and no deficit → drops L2→NONE (fast)', () => {
+  const win = 1000;
+  const dropWindows = Math.ceil(LADDER_RECOVER_MS / win); // 2 windows
+  let s = LS(RUNG_L2);
+  // headroomInput has the decoder comfortably ahead (forward_headroom = 5 frames → check_framedrop release).
+  for (let i = 0; i < dropWindows - 1; i++) {
+    s = ladderStep(s, headroomInput(50, 1, win));
+    assert.equal(s.rung, RUNG_L2, 'holds rung-1 until the re-probe settle elapses');
+  }
+  s = ladderStep(s, headroomInput(50, 1, win));
+  assert.equal(s.rung, RUNG_NONE, 'releases skip-non-ref once comfortably caught up');
+});
+
+test('forward-headroom BREAKS THE LATCH: a maxed ladder with masked throughput but a decoder ahead de-escalates to NONE', () => {
+  // At the TOP rung the relief levers MASK the throughput signals (skip-non-ref + half-cadence depress decodeFps
+  // AND presentFps, so the throughput `headroom` can NEVER fire); the decoder is actually comfortably AHEAD
+  // (large forward headroom). The masked-throughput de-escalation can never move from here; forward headroom must.
+  const win = 1000;
+  const fp = 1e6 / 50;
+  let s = LS(RUNG_MAX);
+  for (let i = 0; i < 40; i++) {
+    const inp = { ...underInput(50, 2, win) }; // "looks bound" by throughput (present/decodeFps depressed)
+    inp.presentFps = 20;
+    inp.decodeFps = 20;
+    inp.forwardHeadroomUs = 8.0 * fp;          // … but the decoder is comfortably ahead (the un-maskable truth)
+    s = ladderStep(s, inp);
+  }
+  assert.equal(s.rung, RUNG_NONE, 'forward headroom de-escalates the latched ladder to the full-rate path');
+});
+
+test('rung-1 is HELD inside the [1,3]-frame hysteresis band with no sustained deficit (skip-non-ref must not flap)', () => {
+  let s = LS(RUNG_L2);
+  const fp = 1e6 / 50;
+  for (let i = 0; i < 40; i++) {
+    // Decoder marginally ahead (2 frames) → inside the [1,3]-frame band → check_framedrop stays engaged;
+    // present is below target (NO throughput headroom) and the stream keeps up (NOT under) → neither a climb
+    // nor a de-escalation fires.
+    const inp = { ...ambiguousInput(50, 1, 1000) };
+    inp.forwardHeadroomUs = 2.0 * fp; // in the [1,3]-frame band → fd holds engaged
+    s = ladderStep(s, inp);
+  }
+  assert.equal(s.rung, RUNG_L2, 'holds skip-non-ref while the decoder is marginally ahead (no flap)');
+});
+
+test('min-content-fps guard: genuinely low-fps content (≤20) NEVER degrades, however decode-bound', () => {
+  const win = 500;
+  let s = LS(RUNG_NONE);
+  for (let i = 0; i < 200; i++) s = ladderStep(s, underInput(LADDER_MIN_CONTENT_FPS - 2, 1, win));
+  assert.equal(s.rung, RUNG_NONE, 'mpv fps≤20 framedrop guard: never degrade low-fps content');
 });
 
 test('guards: paused / cadence-inactive / no-content-period never climb even with a low present fps', () => {
-  for (const variant of [
-    { ...decodeBound50, paused: true },
-    { ...decodeBound50, cadenceActive: false },
-    { ...decodeBound50, haveContentPeriod: false },
-  ]) {
-    assert.equal(run(RUNG0, variant, climbWins * 3 + 8).rung, RUNG_NONE,
-      `variant ${JSON.stringify(Object.keys(variant).filter((k) => variant[k] === true || variant[k] === false))} must not climb`);
+  const win = 500;
+  for (const patch of [{ paused: true }, { cadenceActive: false }, { haveContentPeriod: false }]) {
+    let s = LS(RUNG_NONE);
+    for (let i = 0; i < 200; i++) s = ladderStep(s, { ...underInput(50, 1, win), ...patch });
+    assert.equal(s.rung, RUNG_NONE, `${JSON.stringify(patch)} must not climb`);
   }
 });
 
-test('demux pressure is a WEAK HINT only: a drained-ring window with a healthy clock + full ring never climbs', () => {
-  // No clock deficit, ring not draining, no demux pressure → cantKeepUp false even though present dipped → no climb.
-  const dip = { ...capable, presentFps: 30, clockRateRatio: 1.0, ringLow: false, ringHealthy: true, demuxPressure: false };
-  assert.equal(run(RUNG0, dip, climbWins * 3 + 8).rung, RUNG_NONE, 'a present dip with no can\'t-keep-up evidence is not decode-bound');
-});
-
-test('demux pressure ALONE can carry "can\'t keep up" when the clock window is invalid (0)', () => {
-  // clockRateRatio 0 (a re-anchored/seam window = no valid clock) → the demux-ring hint + a draining ring still
-  // let a genuine decode deficit climb (the hint strengthens cantKeepUp; it is never a *required* gate).
-  const noClock = { ...decodeBound50, clockRateRatio: 0, demuxPressure: true };
-  assert.equal(run(RUNG0, noClock, climbWins + 2).rung, RUNG_L2, 'a draining ring + demux pressure climbs without a clock reading');
-});
-
-test('(vii) a stream right at contentFps ≈ 48 does not oscillate across the rung-2↔3 gate', () => {
-  // 48 is the L1-eligibility boundary. contentFps < 48 caps at rung 2; ≥ 48 may reach rung 3. Since contentFps
-  // is a STABLE stream property (the median packet period), the gate decision is deterministic — no flapping.
-  const db47 = { ...decodeBound50, contentFps: 47, presentFps: 30, clockRateRatio: 0.7 };
-  const db48 = { ...decodeBound50, contentFps: 48, presentFps: 30, clockRateRatio: 0.7 };
-  assert.ok(47 < LADDER_L1_MIN_FPS && 48 >= LADDER_L1_MIN_FPS, 'the gate is at 48 fps');
-  assert.equal(run(RUNG0, db47, climbWins * 4 + 20).rung, RUNG_L2_L3, '47 fps caps at rung 2 (just under the gate)');
-  // 48 fps: climb, then HOLD — at rung 3 the still-decode-bound input is neither under (present 30 vs target
-  // 24×0.85=20.4) nor headroom (clock 0.7<1.0) → it settles at 3 with NO bounce back to 2.
-  const { state, path } = runDyn(RUNG0, () => db48, climbWins * 4 + 40);
-  assert.equal(state.rung, RUNG_L2_L3_L1, '48 fps reaches rung 3 (at the gate, halving is allowed)');
-  for (let i = 1; i < path.length; i++) assert.ok(path[i] > path[i - 1], `monotonic climb, no flap (path ${path})`);
-});
-
-test('(v) RECOVERY de-escalates rung 3 → 0 in strict L1→L3→L2 order, slowly, without flapping', () => {
-  // The stream recovered (now capable). The present reads content/decimation: at rung 3 (L1 caps display) it
-  // reads 25 = the halved target → headroom; dropping L1 (3→2) doubles the target to 50, which the recovered
-  // decoder now meets → headroom continues → 2→1 (drop L3) → 1→0 (drop L2). Each drop needs LADDER_DROP_MS of
-  // sustained headroom (asymmetric/slow), so it cannot flap.
-  const recovered = (rung) => ({
-    ...capable, presentFps: 50 / rungDecimation(rung), contentFps: 50, clockRateRatio: 1.0,
-    ringLow: false, ringHealthy: true, presentRingFull: false, demuxPressure: false,
-  });
-  const start = { rung: RUNG_L2_L3_L1, climbMs: 0, dropMs: 0 };
-  const { state, path } = runDyn(start, recovered, dropWins * 3 + 12);
-  assert.equal(state.rung, RUNG_NONE, 'a fully recovered stream de-escalates all the way to rung 0');
-  assert.deepEqual(path, [RUNG_L2_L3_L1, RUNG_L2_L3, RUNG_L2, RUNG_NONE],
-    'strict reverse order L1→L3→L2 (3→2→1→0), one rung at a time, no skipped/re-climbed rung');
-});
-
-test('(v) de-escalation is SLOW (asymmetric hysteresis): a single non-headroom window resets the drop streak', () => {
-  // Sit at rung 3 with headroom for almost dropWins, inject ONE ambiguous window → the drop streak resets and
-  // it must re-accumulate a FULL dropWins before dropping (so transient capable blips can't drop a needed lever).
-  const headroom3 = { ...capable, presentFps: 25, contentFps: 50, clockRateRatio: 1.0 }; // rung-3 healthy (target 25)
-  const ambiguous = { ...headroom3, clockRateRatio: 0.97 };                              // not headroom (clock < 1.0), not under
-  let s = run({ rung: RUNG_L2_L3_L1, climbMs: 0, dropMs: 0 }, headroom3, dropWins - 1);
-  assert.equal(s.rung, RUNG_L2_L3_L1, 'not yet dropped (one window short)');
-  assert.ok(s.dropMs > 0, 'drop streak accumulating');
-  s = ladderStep(s, ambiguous);
-  assert.equal(s.dropMs, 0, 'the ambiguous window zeroed the drop streak');
-  s = run(s, headroom3, dropWins - 1);
-  assert.equal(s.rung, RUNG_L2_L3_L1, 'still at rung 3 — it must re-sustain a FULL drop window');
-});
-
-test('MANUAL Lever-1 (present-half) does NOT confound the ladder: a CAPABLE stream stays rung 0', () => {
-  // Review Finding 1: when manual present-half caps the display, present reads ~25 on 50fps content. The ladder
-  // MUST measure against the manual-aware target (contentFps ÷ active decimation = 25), so present 25 ≈ target
-  // is NOT under — even with a can't-keep-up hint. Else manual L1 would falsely climb to L2+L3 decode skips.
-  const manualHalfCapable = {
-    cadenceActive: true, paused: false, haveContentPeriod: true,
-    presentFps: 25, contentFps: 50, decimation: 2, // manual present-half forces decimation 2
-    clockRateRatio: 1.0, ringLow: true, ringHealthy: false, presentRingFull: false, demuxPressure: true, dWallMs: WIN,
-  };
-  const s = run(RUNG0, manualHalfCapable, climbWins * 3 + 12);
-  assert.equal(s.rung, RUNG_NONE, 'manual L1 halving the display must NOT trip the auto decode-skip ladder');
-});
-
-test('(v) de-escalation tolerates cap rounding: a recovered rung-3 stream measuring 24 (cap 25) still drops L1', () => {
-  // Review Finding 2: the Bresenham cap-2 cadence + window rounding can settle the displayed rate at 24 fps
-  // (one frame under the 25 cap) on a fully recovered stream. The over-frac (0.90) must accept 24/25 = 0.96 as
-  // headroom, else the highest/most-visible rung would pin forever. (media/wall ≥1.0 + ring healthy = recovered.)
-  const recovered24 = { ...capable, presentFps: 24, contentFps: 50, decimation: 2, clockRateRatio: 1.0, ringHealthy: true };
-  const s = run({ rung: RUNG_L2_L3_L1, climbMs: 0, dropMs: 0 }, recovered24, dropWins + 4);
-  assert.equal(s.rung, RUNG_L2_L3, 'a recovered stream at 24-on-25 de-escalates L1 (rounding tolerance)');
-});
-
-test('a genuinely decode-bound stream PINS at its rung (no re-probe): media/wall < 1.0 → never headroom', () => {
-  // At rung 3 the real-4K10@50 sits decode-bound: present ~24 (≈ target 25) but media/wall stays < 1.0. That
-  // fails the headroom clock gate, so it never starts a de-escalation → no rung-2↔3 oscillation at the ceiling.
-  const ceiling3 = { ...capable, presentFps: 24, contentFps: 50, clockRateRatio: 0.9, ringLow: false, ringHealthy: true };
-  const s = run({ rung: RUNG_L2_L3_L1, climbMs: 0, dropMs: 0 }, ceiling3, dropWins * 2);
-  assert.equal(s.rung, RUNG_L2_L3_L1, 'a still-decode-bound top rung holds — no premature L1 drop / re-probe');
-  assert.equal(s.dropMs, 0, 'no drop streak accrues while media/wall stays sub-realtime');
+test('demux pressure ALONE carries "can\'t keep up" when the clock window is invalid (0) — climbs to L2', () => {
+  // clockRateRatio 0 (a re-anchored/seam window = no valid clock) → the demux-ring hint + a draining ring + the
+  // decoder behind still let a genuine decode deficit engage rung-1 (the hint strengthens cantKeepUp).
+  const win = 500;
+  let s = LS(RUNG_NONE);
+  const inp = { ...underInput(50, 1, win), clockRateRatio: 0, demuxPressure: true };
+  for (let i = 0; i < Math.ceil(CHECK_FRAMEDROP_SUSTAIN_MS / win); i++) s = ladderStep(s, inp);
+  assert.equal(s.rung, RUNG_L2, 'a draining ring + demux pressure climbs without a clock reading');
 });
 
 console.log(`\ndegrade-cadence: ${passed} passed`);

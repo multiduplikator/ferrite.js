@@ -26,6 +26,9 @@ export type PlaybackStateName =
   | 'playing'      // presenting at the live edge
   | 'paused'       // user-paused (live: gate closed; VOD: position held)
   | 'reconnecting' // LIVE: a recoverable drop (network / upstream-silence) → the source is re-opening with backoff
+  | 'eof'          // end-of-stream reached (source/decoder drained) — `paused()` reads stopped + the host has
+                   // been told (LOADING_COMPLETE), but NOT torn down: a fresh `load` restarts, `userDestroy`
+                   // tears down (the global rules below). The combined audio+video EOF gate hangs here.
   | 'closing'      // teardown in progress (pipeline freeing) — TERMINAL-bound
   | 'closed';      // teardown complete (terminal)
 
@@ -44,6 +47,7 @@ export type PlaybackEvent =
   | { type: 'reconnect' }                              // LIVE recoverable drop → enter Reconnecting (the worker is re-opening with backoff)
   | { type: 'recovered' }                              // bytes flowing again after a reconnect → leave Reconnecting (Buffering → Playing)
   | { type: 'recreateDecoder' }                        // transient decode glitch → rebuild the decoder, keep playing (no state change)
+  | { type: 'eof' }                                    // source/decoder reached end-of-stream (the glue raises it from the demux/decode `ended`)
   | { type: 'drained' };                               // teardown finished (Closing → Closed)
 
 /**
@@ -67,7 +71,7 @@ export type TeardownTarget = 'pipeline' | 'present' | 'audio' | 'engine';
 
 /** Outputs the controller asks the glue to perform ("commands out"). NEVER executed here. */
 export type PlaybackCommand =
-  | { type: 'openSource'; mode: PlaybackMode; url: string } // LiveSourcePort.open / VOD AVIO
+  | { type: 'openSource' }                                  // LiveSourcePort.open / VOD AVIO (mode/url read off the controller state)
   | { type: 'feedGate'; open: boolean }                     // backpressure: read (open) / stop reading (close)
   | { type: 'startDecode' }                                 // begin demux+decode+present
   | { type: 'presentReset' }                                // flush present ring + re-anchor the clock
@@ -94,7 +98,7 @@ export function initialState(): PlaybackState {
 }
 
 // --- command constructors (keep the reducer body readable; tree-shake to nothing) -----------------
-const openSource = (mode: PlaybackMode, url: string): PlaybackCommand => ({ type: 'openSource', mode, url });
+const openSource = (): PlaybackCommand => ({ type: 'openSource' });
 const feedGate = (open: boolean): PlaybackCommand => ({ type: 'feedGate', open });
 const startDecode = (): PlaybackCommand => ({ type: 'startDecode' });
 const presentReset = (): PlaybackCommand => ({ type: 'presentReset' });
@@ -142,15 +146,28 @@ export function reduce(s: PlaybackState, e: PlaybackEvent): ReduceResult {
     };
   }
 
+  // A fresh Load (re)starts the lifecycle from ANY non-teardown state — first start, channel zap, OR a re-load
+  // after Eof. Handling Load only from Idle would pin the controller at Playing/Eof while the imperative path
+  // reloaded, so the two could disagree. Closing/Closed ignore it (teardown completes first — the
+  // load-racing-destroy invariant).
+  if (e.type === 'load' && s.name !== 'closing') {
+    return {
+      state: { ...s, name: 'opening', mode: e.mode, url: e.url, bytesIn: 0 },
+      commands: [openSource(), presentReset(), feedGate(true)],
+    };
+  }
+
+  // End-of-stream from any ACTIVE state → Eof (the source/decoder drained). The FIRST Eof transitions + emits
+  // the host 'ended' effect; a second Eof (the other of decode/demux ended) finds the state already Eof and is
+  // inert (Eof falls into the default below), so the host is told exactly once. Re-Load / userDestroy (above)
+  // leave it.
+  if (e.type === 'eof' && (s.name === 'opening' || s.name === 'buffering' || s.name === 'playing' || s.name === 'paused' || s.name === 'reconnecting')) {
+    return { state: { ...s, name: 'eof' }, commands: [emit('ended')] };
+  }
+
   switch (s.name) {
     case 'idle':
-      if (e.type === 'load') {
-        return {
-          state: { ...s, name: 'opening', mode: e.mode, url: e.url, bytesIn: 0 },
-          commands: [openSource(e.mode, e.url), presentReset(), feedGate(true)],
-        };
-      }
-      return same;
+      return same; // load is handled by the global rule above
 
     case 'opening':
       // Source connected / demux opened → start decoding and fill the pre-roll.
@@ -189,12 +206,10 @@ export function reduce(s: PlaybackState, e: PlaybackEvent): ReduceResult {
 
     case 'paused':
       if (e.type === 'userPlay') {
-        // Live resume re-seeks the edge: flush the stale ring + re-anchor, then re-open the gate.
-        // (VOD resume continues in place; the present-reset is a no-op there — refined later per mode.)
-        const cmds: PlaybackCommand[] = s.mode === 'live'
-          ? [presentReset(), feedGate(true)]
-          : [feedGate(true)];
-        return { state: { ...s, name: 'playing' }, commands: cmds };
+        // Resume just re-opens the feed gate. The live-resume re-anchor (flush the stale ring + reset the
+        // present clock) is done IMPERATIVELY by play() at its tuned position (after ensureAudio, before
+        // ctx.resume) — the reducer must NOT also emit it here (that would double-run it, out of order).
+        return { state: { ...s, name: 'playing' }, commands: [feedGate(true)] };
       }
       return same;
 
@@ -211,6 +226,11 @@ export function reduce(s: PlaybackState, e: PlaybackEvent): ReduceResult {
       // A redundant `reconnect` (another backoff attempt) is inert — already Reconnecting. The
       // backoff-EXHAUSTED case arrives as a FATAL `error` → the global rule above drives Closing → the
       // teardown (teardown-from-Reconnecting is TOTAL, like every other state).
+      return same;
+
+    case 'eof':
+      // Inert: a re-load (global rule) restarts the lifecycle, userDestroy (global rule) tears down; every
+      // other event — incl. a second `eof` from the other of decode/demux — is a no-op.
       return same;
 
     case 'closing':

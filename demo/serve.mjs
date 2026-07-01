@@ -10,6 +10,7 @@ import http from 'node:http';
 import { readFile, appendFile } from 'node:fs/promises';
 import { existsSync, statSync, createReadStream } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -84,12 +85,48 @@ const server = http.createServer(async (req, res) => {
       if (fault && !faulting) faultDelivered.delete(fault); // this is the recovery connection → re-arm for next play
       // Pace at ~1× by default when faulting (so faultMs maps to real seconds); else honour ?rateKBps.
       const rateKBps = +(url.searchParams.get('rateKBps') || (faulting ? 3500 : 0));
+
+      // DEFAULT faux-live = a single honest pass: a finite chunked body that EOFs at the fixture end. The
+      // matrix fixtures carry a burned-in per-second timecode so a client-side LOOP or SKIP is VISUALLY obvious
+      // — the demo must NOT loop them (a loop would read as a player bug), and the LiveSourcePort unit tests
+      // need a deterministic EOF. This is the default AND what the demo's `?noloop` requests.
+      //   ?continuous=1 opts INTO a lifelike never-ending live source: ffmpeg loops the finite fixture with
+      //   MONOTONIC PTS (`-stream_loop -1` offsets each loop's timestamps by the input duration → NO backward-
+      //   PTS seam, as a real live clock never resets; `-re` paces realtime). Falls back to a single pass if
+      //   ffmpeg is not installed. Fault modes use the raw single-pass reader below.
+      if (!faulting) {
+        const continuous = url.searchParams.has('continuous') && !url.searchParams.has('noloop');
+        if (continuous) {
+          const ff = spawn('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-re', '-stream_loop', '-1',
+            '-i', abs, '-c', 'copy', '-f', 'mpegts', 'pipe:1'], { stdio: ['ignore', 'pipe', 'ignore'] });
+          let started = false;
+          ff.stdout.on('data', () => { started = true; });
+          ff.stdout.pipe(res);
+          res.on('close', () => { try { ff.kill('SIGKILL'); } catch { /* ignore */ } });
+          ff.on('error', () => { // ffmpeg missing → degrade to a single raw pass (plays once, no monotonic loop)
+            if (started || res.writableEnded) return;
+            const s = createReadStream(abs);
+            res.on('close', () => s.destroy());
+            s.pipe(res);
+            s.on('error', () => { try { res.end(); } catch { /* ignore */ } });
+          });
+          return;
+        }
+        const s = createReadStream(abs);
+        res.on('close', () => s.destroy());
+        s.pipe(res);
+        s.on('error', () => { try { res.end(); } catch { /* ignore */ } });
+        return;
+      }
+
+      // --- fault-injection single pass (recovery tests only): inject ONE boundary/silence event; the client's
+      //     reconnect serves clean (the fault is auto-re-armed above). No loop — the fault IS the point. ---
       const stream = createReadStream(abs, { highWaterMark: 64 * 1024 });
-      res.on('close', () => stream.destroy()); // client gone (Stop) → stop reading the file
       const startMs = Date.now();
       let faultFired = false;
+      res.on('close', () => stream.destroy()); // client gone (Stop) → stop reading
       const maybeFault = () => {
-        if (!faulting || faultFired || Date.now() - startMs < faultMs) return false;
+        if (faultFired || Date.now() - startMs < faultMs) return false;
         faultFired = true;
         faultDelivered.add(fault); // mark delivered → the reconnect serves clean
         stream.destroy();
@@ -97,21 +134,15 @@ const server = http.createServer(async (req, res) => {
         // fault === 'silence': leave `res` OPEN, send no more bytes → the client's silence watchdog trips.
         return true;
       };
-      if (rateKBps > 0) {
-        // Pace the push: write a chunk, then wait so the average rate ≈ rateKBps (a coarse live cadence).
-        stream.on('data', (chunk) => {
-          if (maybeFault()) return;
-          stream.pause();
-          if (res.writableEnded) { stream.destroy(); return; }
-          res.write(chunk);
-          setTimeout(() => stream.resume(), (chunk.length / 1024) / rateKBps * 1000);
-        });
-        stream.on('end', () => res.end());
-        stream.on('error', () => { try { res.end(); } catch { /* ignore */ } });
-      } else {
-        stream.pipe(res); // socket backpressure + the demux low-water gate pace it
-        stream.on('error', () => { try { res.end(); } catch { /* ignore */ } });
-      }
+      stream.on('data', (chunk) => {
+        if (maybeFault()) return;
+        stream.pause();
+        if (res.writableEnded) { stream.destroy(); return; }
+        res.write(chunk);
+        setTimeout(() => stream.resume(), (chunk.length / 1024) / rateKBps * 1000);
+      });
+      stream.on('end', () => res.end());
+      stream.on('error', () => { try { res.end(); } catch { /* ignore */ } });
       return;
     }
 

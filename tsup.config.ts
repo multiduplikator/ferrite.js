@@ -2,9 +2,13 @@ import { defineConfig } from 'tsup';
 
 // Self-contained ESM entries:
 //   index          — the public facade (createPlayer / FerritePlayer)
-//   worker         — the DECODE worker, spawned by index via `new URL('./worker.js', import.meta.url)`
+//   worker         — the VIDEO decode worker, spawned by index via `new URL('./worker.js', import.meta.url)`
+//   demux-worker   — the DEMUX worker (Stage 5: own ferrite realm — ingest/source/demux + both ring producers),
+//                    spawned by index via `new URL('./demux-worker.js', import.meta.url)`
 //   present-worker — the PRESENT worker (split-realm OffscreenCanvas + WebGL2 + rAF + ring/clock),
 //                    spawned by index via `new URL('./present-worker.js', import.meta.url)`
+//   audio-worker   — the AUDIO worker (Stage 4: own ferrite realm — audio decode + PCM-ring producer),
+//                    spawned by index via `new URL('./audio-worker.js', import.meta.url)`
 //   controls       — the optional framework-free controls + debug overlay (`ferrite.js/controls`)
 //
 // splitting:false keeps every entry standalone — critical for the workers, which are loaded as module
@@ -25,7 +29,9 @@ const DEBUG = process.env.FERRITE_DEBUG === '1' || process.env.FERRITE_DEBUG ===
 const libEntry = {
   index: 'src/index.ts',
   worker: 'src/worker/worker.ts',
+  'demux-worker': 'src/worker/demux-worker.ts',
   'present-worker': 'src/worker/present-worker.ts',
+  'audio-worker': 'src/worker/audio-worker.ts',
   controls: 'src/controls/index.ts',
 };
 

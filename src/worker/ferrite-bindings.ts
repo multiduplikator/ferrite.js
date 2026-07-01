@@ -55,13 +55,42 @@ const BENIGN_FFMPEG_LOG = [
 ];
 const isBenignFfmpegLog = (s: string): boolean => BENIGN_FFMPEG_LOG.some((p) => s.includes(p));
 
-export async function loadFerrite(wasmBaseUrl: string, pool: number): Promise<Ferrite> {
+// Per-realm WebAssembly.Memory sizing (pages; 1 page = 64 KiB). The worker-realm split (the reference player)
+// gives each realm a footprint-matched heap instead of every realm reserving the decode tier's 1.5 GiB of
+// virtual address space up front (a memory-constrained iPad/iPhone can refuse to instantiate three 1.5 GiB
+// reservations). The DEMUX+VIDEO realm keeps the heavy decode tier (4K/HEVC frame buffers); the AUDIO realm
+// (ferritePool=1, decode + downmix + resample → ~16 MiB even at 7.1/96 kHz) gets a small 16 MiB init / 32 MiB
+// cap. Confirmed against the reference player's audio-realm memory caps.
+export const MEM_DECODE_INIT = 4096;  // 256 MiB — the VIDEO decode tier (4K/HEVC frame geometry)
+export const MEM_DECODE_MAX = 24576;  // 1.5 GiB — measured peak ~1.1 GiB; ample headroom
+export const MEM_AUDIO_INIT = 256;    // 16 MiB — the audio realm (light: decode + stereo downmix + resample)
+export const MEM_AUDIO_MAX = 512;     // 32 MiB (2×) — bound for 7.1/96 kHz; never grows into the decode tier
+// DEMUX realm (ferritePool=0 — single-threaded ingest/demux, no decoders). It holds only the demux
+// ring (compressed read-ahead — ~1 s of bitstream, capped MAX_BUFFERED 16 MiB) + the AU copy scratch, never
+// a frame buffer, so a small footprint-matched heap is enough. Confirmed against the reference player
+// MEM_DEMUX_INIT/MAX (512 pages = 32 MiB init, 1536 pages = 96 MiB max) + demux.rs's handle_init_load.
+export const MEM_DEMUX_INIT = 512;    // 32 MiB — the demux realm (compressed read-ahead only)
+export const MEM_DEMUX_MAX = 1536;    // 96 MiB (1.78×) — bound for high-bitrate read-ahead; never grows into the decode tier
+
+/** Load the engine into THIS realm. `pool` is the emscripten pthread budget; `memInitialPages`/`memMaxPages`
+ *  size this realm's growable shared heap (defaults = the decode tier — the existing single-realm call shape
+ *  is unchanged). The AUDIO worker passes MEM_AUDIO_INIT/MAX (a small realm); the demux+video worker keeps
+ *  the decode-tier default. */
+export async function loadFerrite(
+  wasmBaseUrl: string,
+  pool: number,
+  memInitialPages: number = MEM_DECODE_INIT,
+  memMaxPages: number = MEM_DECODE_MAX,
+): Promise<Ferrite> {
   const mod = await import(/* @vite-ignore */ `${wasmBaseUrl}ferrite.mjs`);
   // Provide the shared WebAssembly.Memory OURSELVES (emscripten honors an incoming Module.wasmMemory)
   // and KEEP the handle — the only stable cross-realm reference to the live buffer after a pthread grow.
-  // The descriptor MUST match the engine build (INITIAL_MEMORY=256 MiB → 4096 pages, MAXIMUM_MEMORY=2 GiB
-  // → 32768 pages, shared) or instantiation fails. (build-engine.sh: INITIAL=268435456, MAXIMUM=2147483648.)
-  const memory = new WebAssembly.Memory({ initial: 268435456 / 65536, maximum: 32768, shared: true }); // 256 MiB initial → GROWABLE to 2 GiB (32768 pages), matching build-engine.sh MAXIMUM_MEMORY=2GB. (We briefly ran 4 GiB to prove the old 2 GiB "wall" was a SIGN bug — V8/Chrome M83 made wasm heap access unsigned — but measured peak is only ~1.1 GiB, and for SHARED memory the MAXIMUM is reserved as virtual address space up front, so a 4 GiB ceiling only raises iOS instantiation risk for no gain.) The fix that MATTERS is kept: every engine POINTER is read UNSIGNED (`ptr >>> 0`), since a >2 GiB pointer returns signed-negative and `new Uint16Array(buffer, negOffset)` throws. liveHeap() re-reads HEAPU8 after a grow.
+  // The descriptor MUST sit within the engine build's bounds: host initial ≥ engine INITIAL_MEMORY floor
+  // (16 MiB) and host maximum ≤ engine MAXIMUM_MEMORY (2 GiB). The decode realm starts WARM at 256 MiB (4096
+  // pages — it carries demux + video decode) and caps at 1.5 GiB (24576 pages); the audio realm passes a far
+  // smaller pair (MEM_AUDIO_*). For SHARED memory the MAXIMUM is reserved as virtual address space UP FRONT,
+  // so the per-realm sizing keeps the audio realm from reserving the decode tier's 1.5 GiB it never needs.
+  const memory = new WebAssembly.Memory({ initial: memInitialPages, maximum: memMaxPages, shared: true }); // GROWABLE per-realm (decode: 256 MiB→1.5 GiB; audio: 16 MiB→32 MiB). The fix that MATTERS is kept: every engine POINTER is read UNSIGNED (`ptr >>> 0`), since a >2 GiB pointer returns signed-negative and `new Uint16Array(buffer, negOffset)` throws. liveHeap() re-reads HEAPU8 after a grow.
   const M: RawModule = await mod.default({
     ferritePool: pool,
     wasmMemory: memory,
@@ -192,12 +221,26 @@ export class Ferrite {
   }
   /** Re-arm live param-set capture on a mid-stream codec change (drop the previous codec's extradata). */
   demuxResetVExtradata(d: number): void { this.M._ferrite_demux_reset_v_extradata(d); }
+  /** Heap view of the resolved AUDIO extradata (AudioSpecificConfig for raw AAC etc.); empty for self-
+   *  describing mpegts ADTS. The decode-split AUDIO worker needs it (it has no demux handle) to build its
+   *  decoder via audioNewWithExtradata. SOFT-NO-OP (empty) against an engine wasm that predates the accessor
+   *  — live ADTS is unaffected; a VOD AAC ASC simply isn't shipped until the engine is rebuilt. */
+  demuxAExtradata(d: number): Uint8Array {
+    const sz = this.M._ferrite_demux_a_extradata_size;
+    const ptrFn = this.M._ferrite_demux_a_extradata;
+    if (!sz || !ptrFn) return new Uint8Array(0); // pre-accessor wasm → no audio extradata shipped
+    const ptr = ptrFn(d) >>> 0, len = sz(d);
+    return ptr && len > 0 ? this.liveHeap().slice(ptr, ptr + len) : new Uint8Array(0); // detached copy (crosses the worker boundary)
+  }
   demuxStep(d: number): number { return this.M._ferrite_demux_step(d); }
   demuxPktStream(d: number): number { return this.M._ferrite_demux_pkt_stream(d); }
   demuxPktDataPtr(d: number): number { return this.M._ferrite_demux_pkt_data(d); }
   demuxPktSize(d: number): number { return this.M._ferrite_demux_pkt_size(d); }
   demuxPktPtsUs(d: number): bigint { return this.M._ferrite_demux_pkt_pts_us(d); }
   demuxPktIsKey(d: number): number { return this.M._ferrite_demux_pkt_is_key(d); }
+  /** HEVC picture-class bitfield of the current video packet (b0 idr / b1 cra / b2 rasl / b3 irap); 0 for
+   *  audio / non-HEVC / unparsable — degrades cleanly to the blunt isKey. Drives the RASL-skip latch. */
+  demuxPktNalFlags(d: number): number { return this.M._ferrite_demux_pkt_nal_flags(d); }
   demuxFree(d: number): void { this.M._ferrite_demux_free(d); }
 
   // --- video decode ---
@@ -205,9 +248,39 @@ export class Ferrite {
   /** VOD/file: build the video decoder FROM the demuxer's stream — copies AVCC/HVCC extradata so the
    *  length-prefixed MP4/MKV NALs decode (the bare vdecNew has no extradata → can't parse them). */
   vdecNewFromDemux(d: number, threads: number): number { return this.M._ferrite_vdec_new_from_demux(d, threads); }
+  /** STAGE-5 DECODE-SPLIT (video worker): build the video decoder from a codec id + the out-of-band extradata
+   *  (avcC/hvcC for length-prefixed MP4/MKV; Annex-B param sets for live) shipped across the worker boundary —
+   *  the VIDEO worker has no demux handle, so it can't use vdecNewFromDemux. Live mpegts ships an EMPTY/Annex-B
+   *  extradata → the engine falls back to the bare decoder (in-band SPS). SOFT-NO-OP against an engine wasm that
+   *  predates the export: with no extradata it degrades to bare `vdecNew(codecId)` (live works fully; a VOD
+   *  avcC/hvcC simply isn't applied until the engine is rebuilt — the same soft-degrade idiom as
+   *  audioNewWithExtradata). */
+  vdecNewWithExtradata(codecId: number, threads: number, ed: Uint8Array): number {
+    const fn = this.M._ferrite_vdec_new_with_extradata;
+    if (!fn) return this.M._ferrite_vdec_new(codecId, threads); // pre-export wasm → bare decoder (live Annex-B only)
+    if (ed.length === 0) return fn(codecId, 0, 0, threads);
+    const p = this.M._malloc(ed.length) >>> 0; // unsigned: a >2 GiB pointer reads signed-negative
+    this.liveHeap().set(ed, p);                // liveHeap: a concurrent grow may have left HEAPU8 stale
+    const v = fn(codecId, p, ed.length, threads);
+    this.M._free(p);
+    return v;
+  }
   /** pkt is a wasm-heap pointer (the demux packet) — pass straight through, no copy. */
   vdecPush(v: number, ptr: number, len: number, ptsUs: bigint): number {
     return this.M._ferrite_vdec_push(v, ptr, len, ptsUs);
+  }
+  /** STAGE-5: push one encoded VIDEO AU held as a JS `Uint8Array` (the VIDEO worker reads it out of the video
+   *  packet ring, not the engine heap). Copy into the wasm heap, push the pointer (the engine memcpys it into
+   *  an AVPacket), then free — exactly the AUDIO worker's audioPushAu form (the demux is in a DIFFERENT realm
+   *  now, so the AU lives in JS, not this engine's heap). len=0 → EOF drain. */
+  vdecPushAu(v: number, au: Uint8Array, ptsUs: bigint): number {
+    const len = au.length;
+    if (len === 0) return this.M._ferrite_vdec_push(v, 0, 0, ptsUs); // EOF drain
+    const p = this.M._malloc(len) >>> 0; // unsigned: a >2 GiB pointer reads signed-negative
+    this.liveHeap().set(au, p);          // liveHeap: a concurrent grow may have left HEAPU8 stale
+    const r = this.M._ferrite_vdec_push(v, p, len, ptsUs);
+    this.M._free(p);
+    return r;
   }
   vdecStep(v: number): number { return this.M._ferrite_vdec_step(v); }
   vdecW(v: number): number { return this.M._ferrite_vdec_w(v); }
@@ -254,16 +327,86 @@ export class Ferrite {
    *  decoded frames + decode work); `skipLoop` skips the in-loop deblock (all frames kept, softer).
    *  0/0 restores the default. Re-applied by the worker after every (re)create so the choice persists. */
   vdecSetSkips(v: number, skipNonref: number, skipLoop: number): void { this.M._ferrite_vdec_set_skips(v, skipNonref, skipLoop); }
+  /** Toggle AV_CODEC_FLAG2_FAST (mpv --vd-lavc-fast): non-spec-compliant SW decode speedups. Process-global;
+   *  applies at avcodec_open2, so the worker sets it BEFORE (re)creating a decoder. OFF by default. */
+  setFastDecode(on: boolean): void { this.M._ferrite_set_fast_decode(on ? 1 : 0); }
+  /** B-FLUSH: clear the decoder's DPB/reference state (avcodec_flush_buffers) keeping the open context —
+   *  Fix-B's Live drop-to-keyframe calls this after skipping deltas to the next IDR, so the decoder doesn't
+   *  predict the post-skip IDR's followers from the discarded reference frames (→ corruption / re-wedge).
+   *  No re-init: the skip controls / extradata persist; the lazy deint graph is dropped + rebuilt next frame. */
+  vdecFlush(v: number): void { this.M._ferrite_vdec_flush(v); }
   vdecDeintFailed(v: number): number { return this.M._ferrite_vdec_deint_failed(v); }
   vdecFree(v: number): void { this.M._ferrite_vdec_free(v); }
+
+  // --- WebCodecs strict-form (Fix A: live → VOD parity). Build the hvcC/avcC `description` from Annex-B
+  //     VPS/SPS/PPS, and reframe one Annex-B access unit → length-prefixed (4-byte) NALs — via FFmpeg's OWN
+  //     mov-muxer writers in the engine (ff_isom_write_{hvcc,avcc} / ff_hevc_annexb2mp4_buf /
+  //     ff_nal_parse_units_buf). codecId = 173 (HEVC) / 27 (H.264). Both return a FRESH owned copy: the
+  //     engine buffer is thread-local + freed on the next call, and the await-laden pump (plus a cross-pthread
+  //     heap grow) can outlive a bare view — so copy out immediately, exactly like auCopy. ---
+  /** Build the VideoDecoder `description` (avcC/hvcC config record) from Annex-B param-set extradata.
+   *  Empty on failure / unsupported codec. One-shot per (re)configure — not on the per-AU hot path. */
+  wcBuildConfig(annexb: Uint8Array, codecId: number): Uint8Array {
+    if (annexb.length === 0) return new Uint8Array(0);
+    const p = this.M._malloc(annexb.length) >>> 0; // unsigned: a >2 GiB pointer reads signed-negative
+    this.liveHeap().set(annexb, p);                // liveHeap: a concurrent decode-pthread grow may have left HEAPU8 stale
+    const size = this.M._ferrite_wc_build_config(p, annexb.length, codecId) >>> 0;
+    this.M._free(p);
+    if (size === 0) return new Uint8Array(0);
+    const cfg = this.M._ferrite_wc_config_ptr() >>> 0;
+    if (cfg === 0) return new Uint8Array(0);
+    return this.liveHeap().slice(cfg, cfg + size); // fresh copy: build may have grown the heap; own the bytes
+  }
+  /** Reframe one Annex-B access unit → length-prefixed (4-byte) NALs (the form WebCodecs wants once a
+   *  `description` is set). Returns a FRESH copy (empty on failure → caller drops the AU). */
+  wcReframeAu(au: Uint8Array, codecId: number): Uint8Array {
+    if (au.length === 0) return new Uint8Array(0);
+    const p = this.M._malloc(au.length) >>> 0;
+    this.liveHeap().set(au, p);
+    const size = this.M._ferrite_wc_reframe_au(p, au.length, codecId) >>> 0;
+    this.M._free(p);
+    if (size === 0) return new Uint8Array(0);
+    const out = this.M._ferrite_wc_au_ptr() >>> 0;
+    if (out === 0) return new Uint8Array(0);
+    return this.liveHeap().slice(out, out + size); // owned copy: survives the next call / a heap grow
+  }
 
   // --- audio decode ---
   audioNew(codecId: number): number { return this.M._ferrite_audio_new(codecId); }
   /** VOD/file: build the audio decoder FROM the demuxer's stream — copies codecpar extradata (raw AAC
    *  AudioSpecificConfig etc., which MP4/MKV carry out-of-band, unlike self-describing mpegts ADTS). */
   audioNewFromDemux(d: number): number { return this.M._ferrite_audio_new_from_demux(d); }
+  /** DECODE-SPLIT (audio worker): build the audio decoder from a codec id + the out-of-band extradata
+   *  (AudioSpecificConfig) shipped across the worker boundary — the audio worker has no demux handle, so it
+   *  can't use audioNewFromDemux. Live ADTS ships an EMPTY extradata (self-describing) → the engine falls
+   *  back to the bare decoder. SOFT-NO-OP against an engine wasm that predates the export: with no extradata
+   *  it degrades to bare `audioNew(codecId)` (live ADTS works fully; a VOD AAC ASC simply isn't applied until
+   *  the engine is rebuilt — the same soft-degrade idiom as audioSetOutRate?./audioSrcChannels). */
+  audioNewWithExtradata(codecId: number, ed: Uint8Array): number {
+    const fn = this.M._ferrite_audio_new_with_extradata;
+    if (!fn) return this.M._ferrite_audio_new(codecId); // pre-export wasm → bare decoder (live ADTS only)
+    if (ed.length === 0) return fn(codecId, 0, 0);
+    const p = this.M._malloc(ed.length) >>> 0; // unsigned: a >2 GiB pointer reads signed-negative
+    this.liveHeap().set(ed, p);                // liveHeap: a concurrent grow may have left HEAPU8 stale
+    const a = fn(codecId, p, ed.length);
+    this.M._free(p);
+    return a;
+  }
   audioPush(a: number, ptr: number, len: number, ptsUs: bigint): number {
     return this.M._ferrite_audio_push(a, ptr, len, ptsUs);
+  }
+  /** Push one encoded audio AU held as a JS `Uint8Array` (the AUDIO worker reads it out of the packet ring,
+   *  not the engine heap). Copy into the wasm heap, push the pointer (the engine memcpys it into an AVPacket),
+   *  then free. The DECODE worker uses the pointer-form `audioPush` (the AU is already in its heap); the AUDIO
+   *  worker has the bytes in JS, so it needs this copy-in form. */
+  audioPushAu(a: number, au: Uint8Array, ptsUs: bigint): number {
+    const len = au.length;
+    if (len === 0) return this.M._ferrite_audio_push(a, 0, 0, ptsUs); // EOF drain
+    const p = this.M._malloc(len) >>> 0; // unsigned: a >2 GiB pointer reads signed-negative
+    this.liveHeap().set(au, p);          // liveHeap: a concurrent grow may have left HEAPU8 stale
+    const r = this.M._ferrite_audio_push(a, p, len, ptsUs);
+    this.M._free(p);
+    return r;
   }
   audioStep(a: number): number { return this.M._ferrite_audio_step(a); }
   audioInterleavedPtr(a: number): number { return this.M._ferrite_audio_interleaved(a); }

@@ -39,18 +39,29 @@ uint32_t       ferrite_demux_pkt_size(RDDemux*);
 int64_t        ferrite_demux_pkt_pts_us(RDDemux*);     // INT64_MIN if no pts
 int64_t        ferrite_demux_pkt_dts_us(RDDemux*);
 int            ferrite_demux_pkt_is_key(RDDemux*);     // 1 = AV_PKT_FLAG_KEY set (for WebCodecs Key/Delta)
+uint32_t       ferrite_demux_pkt_nal_flags(RDDemux*);  // HEVC pic class: b0 idr b1 cra b2 rasl b3 irap (0 = n/a)
 int            ferrite_demux_v_profile(RDDemux*);      // video codecpar profile (-99 = unknown)
 int            ferrite_demux_v_level(RDDemux*);        // video codecpar level   (-99 = unknown)
 int            ferrite_demux_v_sar_num(RDDemux*);      // pixel aspect (SAR) via one-shot keyframe decode; 1 if square/unknown
 int            ferrite_demux_v_sar_den(RDDemux*);      // — all-codec (the WebCodecs tier has no FFmpeg decoder to read it off)
 const uint8_t* ferrite_demux_v_extradata(RDDemux*);    // resolved video param sets (Annex-B); 0 until captured
 int            ferrite_demux_v_extradata_size(RDDemux*); // extradata byte count; 0 until captured
+const uint8_t* ferrite_demux_a_extradata(RDDemux*);    // resolved audio extradata (AAC ASC etc.); 0 for ADTS. Decode-split audio worker
+int            ferrite_demux_a_extradata_size(RDDemux*); // audio extradata byte count; 0 for self-describing mpegts ADTS
 void           ferrite_demux_reset_v_extradata(RDDemux*); // re-arm capture on a mid-stream codec change
 void           ferrite_demux_free(RDDemux*);
+// --- WebCodecs strict-form helpers (live → VOD parity; reuse FFmpeg's own mov-muxer functions) ---
+// Build the hvcC/avcC `description` from Annex-B extradata; reframe one Annex-B AU to length-prefixed NALs.
+// codec_id = AV_CODEC_ID_HEVC / AV_CODEC_ID_H264. Output is THREAD-LOCAL — copy it out before the next call.
+int            ferrite_wc_build_config(const uint8_t* annexb, int annexb_size, int codec_id); // → config size
+const uint8_t* ferrite_wc_config_ptr(void);                                                   // built record
+int            ferrite_wc_reframe_au(const uint8_t* in, int in_size, int codec_id);           // → reframed size
+const uint8_t* ferrite_wc_au_ptr(void);                                                       // reframed AU
 
 // --- AUDIO (decode + swresample to interleaved float; one fixed codec) ---
 RDAudio*       ferrite_audio_new(int codec_id);
 RDAudio*       ferrite_audio_new_from_demux(RDDemux*);  // VOD/file: copies codecpar extradata (raw AAC ASC etc.)
+RDAudio*       ferrite_audio_new_with_extradata(int codec_id, const uint8_t* ed, int ed_len); // VOD decode-split: ASC bytes shipped across the worker boundary (audio worker has no demux). Empty ed → bare.
 int            ferrite_audio_push(RDAudio*, const uint8_t* pkt, uint32_t len, int64_t pts_us); // pkt=NULL/len=0 => EOF drain. 1=ok,0=again,-1=err
 int            ferrite_audio_step(RDAudio*);           // 1 = frame ready, 0 = need-more, -1 = drained/error
 int            ferrite_audio_flush(RDAudio*);          // EOF: drain swr delay line. 1 = final chunk ready, 0 = none
@@ -71,6 +82,7 @@ void           ferrite_audio_free(RDAudio*);
 RDVdec*        ferrite_vdec_new(int codec_id, int threads);
 RDVdec*        ferrite_vdec_new_by_name(const char* name, int threads); // pick decoder by name (av1/libdav1d)
 RDVdec*        ferrite_vdec_new_from_demux(RDDemux*, int threads);      // VOD/file: copies AVCC/HVCC extradata (length-prefixed MP4/MKV NALs)
+RDVdec*        ferrite_vdec_new_with_extradata(int codec_id, const uint8_t* ed, int ed_len, int threads); // Stage-5 decode-split: avcC/hvcC bytes shipped across the worker boundary (VIDEO worker has no demux). Empty ed → bare.
 int            ferrite_vdec_push(RDVdec*, const uint8_t* pkt, uint32_t len, int64_t pts_us); // pkt=NULL => EOF drain
 int            ferrite_vdec_step(RDVdec*);             // 1 = frame ready, 0 = need-more, -1 = drained/error
 int            ferrite_vdec_w(RDVdec*);
@@ -96,6 +108,9 @@ void           ferrite_vdec_set_deint(RDVdec*, int mode); // deinterlace: 0=off 
 // mid-stream, no re-init). skip_nonref → AVDISCARD_NONREF (~half the decoded frames + decode work);
 // skip_loopfilter → AVDISCARD_ALL (skip in-loop deblock, all frames kept, slightly softer). 0/0 = default.
 void           ferrite_vdec_set_skips(RDVdec*, int skip_nonref, int skip_loopfilter);
+// Clear DPB/reference state (avcodec_flush_buffers) keeping the open context — Fix-B drop-to-keyframe calls
+// this after skipping deltas to the next IDR so the decoder doesn't predict from discarded refs. No re-init.
+void           ferrite_vdec_flush(RDVdec*);
 int            ferrite_vdec_deint_failed(RDVdec*);    // 1 = deint requested but the filter graph won't build
 void           ferrite_vdec_free(RDVdec*);
 

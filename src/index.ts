@@ -21,17 +21,26 @@ import type { FerriteStats, MediaDataSource, MediaInfo, StatisticsInfo, Tier, Wo
 import { Events, codecName } from './types';
 import { type FerriteConfig, mergeConfig, resolveThreadCount } from './config';
 import { ErrorTypes, ErrorDetails, LoaderErrors, mapFerriteError, type FerriteError } from './errors';
-import type { MainToWorker, WorkerToMain, MainToPresent, PresentToMain } from './protocol';
-import { CLOCK_SLOTS, C_ACLOCK, C_AUDIO } from './protocol';
+import type { MainToWorker, WorkerToMain, MainToPresent, PresentToMain, MainToAudio, AudioToMain, MainToDemux, DemuxToMain } from './protocol';
+import { CLOCK_SLOTS, C_AUDIO, C_OUTPUT_LATENCY_MS, DEMUX_STREAM_VIDEO, DEMUX_STREAM_AUDIO } from './protocol';
+import { VIDEO_RING_SAB_BYTES } from './policy';
+import { allocPacketRing } from './worker/packet-ring-io';
+import { PR_CTRL_SLOTS, PR_DROPS } from './packet-ring';
 import {
-  liveSyncRate, liveSyncTarget, LIVE_SYNC_STALL_RELAX_SECS,
   LOW_WATER_DEFAULT_FLOOR, wcRingCapForPlatform, WC_RING_CAP_DEFAULT,
 } from './policy';
+import {
+  RING_CTRL_SLOTS, RING_CHANNELS,
+  RW_WRITE, RW_READ, RW_UNDERRUNS, RW_OVERWRITES, RW_BASE_MS, RW_PLAYING, RW_RATE, RW_GEN,
+  RW_EDGE_FRAME, RW_EDGE_PTS_MS, RW_EPOCH_SEQ,
+  ringFramesFor, ringSabBytes, AUDIO_PREFILL_SECS,
+} from './audio-ring';
+import { PROCESSOR_NAME, workletUrl } from './worker/audio-worklet';
 import { currentPlatform, type PlatformInfo } from './platform';
 import { PlaybackController, type PlaybackCommand } from './controller/playback';
 import { deriveCapabilities, type SourceCapabilities } from './source/capabilities';
 
-export const version = '1.3.2';
+export const version = '1.3.4';
 
 type Listener = (...args: any[]) => void;
 
@@ -58,27 +67,53 @@ const RING_CAP_IOS = 6;
 // exceed the worker's READY_SETTLE_MS (12s) + the pool reap. The present worker (no engine) acks at once.
 const WORKER_SHUTDOWN_TIMEOUT_MS = 15000;
 
-// Live-sync cadence (the reference player applies these per audio TICK ~12ms; this player schedules per audio
-// CHUNK ~0.25-0.5s, so the same intent maps to a SMALL chunk count). hold = force rate 1.0 after a
-// resume/underrun so latency-sync never fights the resync; decay = drop one stall after this many
-// smooth chunks so a single old underrun doesn't relax the target forever.
-const LIVE_SYNC_RESUME_HOLD_CHUNKS = 4;   // ~1-2 s of chunks (~80 ticks ≈ 1 s)
-const LIVE_SYNC_STALL_DECAY_CHUNKS = 30;  // ~7-15 s of chunks (~1250 ticks ≈ 15 s)
-
-// How often main republishes the audio master clock into the clock SAB. The reference player's audio
-// drain re-arms every ~12ms; the present worker reads at rAF (~16ms) and low-pass-smooths it, so a
-// 10ms publish keeps the SAB sample fresh enough that the PLL never starves. Cheap (reads currentTime
-// + pops a tiny FIFO). Frozen automatically while paused (a suspended AudioContext freezes currentTime).
-const CLOCK_PUBLISH_MS = 10;
+// ---- audio playout: the off-main PCM-ring + AudioWorklet contract -------------------------
+// The per-chunk createBufferSource scheduler (segQ/audioNextStart/publishClock setInterval) is RETIRED.
+// The decode worker now writes engine-resampled interleaved-stereo PCM STRAIGHT into a shared ring (audio-
+// ring.ts); a persistent AudioWorkletProcessor (audio-worklet.ts) pulls one render quantum per process()
+// call AND is the SOLE writer of the cross-realm master clock SAB (C_ACLOCK/C_AUDIO) — so MAIN never
+// runs a main-thread clock timer (the freeze bug: a long task starved the setInterval → the SAB froze →
+// present starved). MAIN's only audio jobs now are: own the AudioContext lifecycle/recovery, size + seed
+// the ring SAB, gate RW_PLAYING (play/pause/rebuffer), and drive the DOM-bound makeup GainNode from the
+// worker's ~2 Hz loudness stats.
+const AUDIO_RING_SECONDS = 0.5; // ring headroom (frames at the ctx output rate); rides ingest hiccups.
+// AUDIO PACKET RING: the encoded-AU SAB the demux+video worker fills + the AUDIO worker consumes.
+// 512 KiB matches the reference player's AUDIO_RING_BYTES — far more than the demux read-ahead ever buffers
+// (~1 s of AAC ≈ tens of KiB), with the demux read-ahead gate keeping it well below the cap so a drop is only
+// a genuine overflow (the audio worker wedged). Allocated on MAIN (so MAIN could read depth for telemetry),
+// handed by reference to the producer (decode worker init) + the consumer (audio worker audioInit).
+const AUDIO_PACKET_RING_BYTES = 512 * 1024;
+// VIDEO PACKET RING: the encoded-AU SAB the DEMUX worker fills (stream 0) + the VIDEO worker
+// consumes. Sized from policy.ts VIDEO_RING_SAB_BYTES (32 MiB) — deep enough to HOLD the LIVE demux read-ahead
+// (LIVE_READAHEAD_MS=4000) at 4K-HEVC bitrates, with the demux's per-ring byte ceiling (VIDEO_RING_CEIL_BYTES=
+// 28 MiB) below the cap so a drop is only a genuine overflow. Allocated on MAIN (so MAIN can read depth for
+// telemetry), handed by reference to the producer (demux worker demuxInit) + the consumer (video worker init).
+const VIDEO_PACKET_RING_BYTES = VIDEO_RING_SAB_BYTES;
+// Live resume-edge re-arm gate: a resume that reaches `running` PROMPTLY after play() is a normal start
+// (desktop's lenient activation, or a gesture-created ctx) — play()'s own epoch + the worker's fresh-anchor
+// coalesce already handle it, so re-arming would needlessly drop the startup buffer. Only a DELAYED resume
+// (iOS missed the activation window → a later gesture; or an interrupted/suspended recovery seconds later)
+// indicates a stale backlog that must be SNAPPED to the live head (the 0ed29715 gate).
+const AUDIO_REARM_MIN_DELAY_MS = 500;
+// AudioContext interrupted-state recovery (OWN ctx only; a host ctx is recovered by the host over its full
+// lifetime — see host-audio.ts). iOS freezes the master clock on the non-standard `interrupted` state
+// (phone call/Siri/route change) and Chromium can drop to `suspended` mid-stream; either freezes the whole
+// pipeline (audio IS the clock). Re-resume on a backoff, capped so a persistent interruption doesn't spin.
+const AUDIO_RECOVERY_MAX_ATTEMPTS = 8;
+const AUDIO_RECOVERY_BACKOFF_MIN_MS = 250;
+const AUDIO_RECOVERY_BACKOFF_MAX_MS = 5000;
 
 // ---- loudness AGC (the reference player's RMS-dBFS → makeup-gain leveller) ----------------------------
+// The RMS/peak FOLD now runs in the decode worker (where the PCM lives); MAIN keeps only the DOM-bound
+// GainNode makeup, driven by the worker's reported loudnessDb/peak (update_loudness_gain/apply_audio_gain).
+// Steady-state live audio-buffer target (s) surfaced as getStats().targetLatency (the a.sync overlay row's
+// reference; the reservoir is bounded by drop-to-live, not chased by playback rate — mpv-faithful).
+const LIVE_TARGET_LATENCY_SECS = 0.375;
 const AGC_TARGET_DB = -18;       // RMS-dBFS target the long-term loudness is nudged toward
 const AGC_MAX_BOOST_DB = 6;      // asymmetric: lift a quiet source by at most +6 dB
 const AGC_MAX_CUT_DB = 9;        // attenuate a hot source by at most −9 dB
-const AGC_LOUDNESS_TAU_S = 12;   // EWMA time constant for the integrated loudness (slow → no pumping)
-const AGC_PEAK_TAU_S = 2;        // decay time constant for the windowed peak (caps the boost vs clipping)
-const AGC_SILENCE_GATE = 1e-7;   // mean-square below this = (near-)silence → hold the loudness estimate
 const AGC_RAMP_TC_S = 0.25;      // setTargetAtTime ramp → smooth gain changes (no zipper noise)
+const AGC_GAIN_EPS_DB = 0.1;     // skip re-ramping the GainNode for a sub-0.1 dB change (zipper/churn)
 
 /** Static capability gate (mpegts.isSupported parity). Capability ONLY — NOT crossOriginIsolated:
  *  isolation is a deployment condition, and the contract wants load() to surface an explicit
@@ -117,12 +152,25 @@ export class FerritePlayer {
   // The SINGLE source-policy descriptor (live/VOD). Computed intent-only at construct/
   // load (so the known-path forks behave correctly IMMEDIATELY, before the worker reports), then REFINED
   // when the worker posts `caps` (the first-response headers). Every main-side live/VOD fork reads a field
-  // of this — seek()/seekbar/duration (seekable), live-edge catch-up + live-sync (hasLiveEdge), the
+  // of this — seek()/seekbar/duration (seekable), live-edge catch-up (hasLiveEdge), the
   // controller transport mode (declaredLive) — never `_isLive` directly.
   private _caps: SourceCapabilities;
 
-  private worker: Worker | null = null;          // DECODE worker
+  private worker: Worker | null = null;          // VIDEO decode worker (video-only — consumes the video packet ring)
   private present: Worker | null = null;          // PRESENT worker (owns the OffscreenCanvas)
+  private audio: Worker | null = null;           // AUDIO worker (own ferrite realm — audio decode + PCM producer)
+  private demux: Worker | null = null;           // DEMUX worker (own ferrite realm — ingest/source/demux + both ring producers)
+  // Deferred demux outbox: the demux worker posts `demuxWorkerReady` once its onmessage is live; we hold
+  // demuxInit / demuxLoad / etc. until then so they arrive in order (mirrors the audio outbox + the reference player's
+  // pending_demux_init). Module workers buffer anyway, but the ready gate keeps the ORDER explicit + robust.
+  private demuxReady = false;
+  private demuxOutbox: MainToDemux[] = [];
+  // Deferred audio outbox: blob-vs-module aside, the audio worker posts `audioWorkerReady` once its onmessage
+  // is live; we hold audioSetPcmRing / audioCodecParams / audioLoad / etc. until then so they arrive in order
+  // after its audioInit (mirrors the reference player's pending_audio_init + audio_outbox flush). Module workers buffer
+  // anyway, but the ready gate keeps the ORDER (audioInit must precede SetPcmRing) explicit + robust.
+  private audioReady = false;
+  private audioOutbox: MainToAudio[] = [];
   private listeners = new Map<string, Set<Listener>>();
   private platform: PlatformInfo = currentPlatform(); // detected once (main has maxTouchPoints)
   private threads = 8;                                 // host-adaptive resolved in the constructor
@@ -136,11 +184,12 @@ export class FerritePlayer {
   private engineDead = false;  // the worker reported an engine-load failure — load() can't proceed
   private loadGen = 0;         // monotonic load generation (load/unload tag, mirrored in the worker)
 
-  // ---- cross-realm master clock: main publishes the audio playout elapsed here; the present worker
-  //      reads it via Atomics. Created only when crossOriginIsolated (SAB requires it). ----
+  // ---- cross-realm master clock: the AudioWorklet (off main) is the SOLE writer of the audio playout
+  //      elapsed here; the present worker reads it via Atomics. MAIN no longer writes C_ACLOCK/C_AUDIO and
+  //      no longer runs a main-thread publish timer (that setInterval was the freeze bug). Created only
+  //      when crossOriginIsolated (SAB requires it). ----
   private clockSab: SharedArrayBuffer | null = null;
   private clock: Int32Array | null = null;
-  private clockTimer: ReturnType<typeof setInterval> | 0 = 0;
 
   // ---- present telemetry mirrored from the present worker (for getStats()/the overlay) ----
   private presentRing = 0;
@@ -170,6 +219,7 @@ export class FerritePlayer {
   private cadenceDrawRate = 0;      // effective draw target (fps) = content rate ÷ tier
   private cadenceDegradeReason = 0; // 0 = none; 1 = an auto ladder rung engaged; 2 = manual override
   private cadenceRung = 0;          // graduated auto-degrade rung: 0 none · 1 skip-non-ref · 2 +skip-loop · 3 +present-cap
+  private cadenceDropToKey = 0;     // Fix-B rung-4 fires this load (Live drop-to-keyframe); 0 on a healthy stream
   // ---- decode-relief LEVERS — the player's resolved lever state (the owner toggles them live
   //      via setLevers()). The present-cap (present=half) drives the PRESENT worker's manual cap; the skips drive the DECODE
   //      worker's engine skip setter. Tracked here so getStats() can tag every telemetry record by combo. ----
@@ -190,10 +240,19 @@ export class FerritePlayer {
   //      the facade's existing methods ARE the imperative side; the controller drives only teardown. ----
   private controller = new PlaybackController((cmd) => this.execCommand(cmd));
   private firstFrameSeen = false; // gate the one-shot `lowWater` dispatch (first present → playing)
+  // mpv audio_start_ao: while pending, audio output is WITHHELD (RW_PLAYING gated via internalPaused) until the
+  // video clock reaches the audio first-sample PTS — so audio never leads video at startup. Armed on play()
+  // (= !firstFrameSeen), released by maybeStartAudioAo() from play()/the present time tick/decode ready.
+  private audioSyncPending = false;
+  private outputLatencyMs = 0; // AudioContext.outputLatency (ms) — published to C_OUTPUT_LATENCY_MS + folded into apts
 
   // ---- media-facade state ----
   private _paused = true;
   private _currentMs = 0;
+  // Single-domain lip-sync (ms): the present worker computes av_diff (master clock − displayed PTS) at the
+  // SAME draw instant (both clocks live there) and ships it on the `time` message — so getStats() never
+  // subtracts a stale _currentMs from a fresh audio read (mpv update_av_diff). NaN until the first time post.
+  private presentAvDiffMs = Number.NaN;
   private _durationMs = 0;     // VOD container duration (0 = live/unknown) — drives duration + the scrub bar
   private _volume = 1;
   private _muted = false;
@@ -203,48 +262,61 @@ export class FerritePlayer {
   private _workerStats: WorkerStats | null = null; // last raw per-interval worker telemetry (feeds getStats)
   private _lastError: FerriteError | null = null;
 
-  // ---- audio (master clock) ----
+  // ---- audio (the off-main PCM-ring + AudioWorklet master clock) ----
+  // The AudioContext: either a HOST-injected, app-lifetime, gesture-unlocked, recovered ctx (attachAudio)
+  // or — standalone — an OWN per-stream ctx the player creates/resumes/closes itself. `audioCtxIsHost`
+  // keys every own-vs-host fork (resume/suspend/close + statechange recovery): the host ctx is NEVER
+  // closed/suspended/handler-touched by the player (it outlives this player + may feed other consumers).
   private audioCtx: AudioContext | null = null;
+  private hostAudioCtx: AudioContext | null = null; // injected via attachAudio() before play()
+  private audioCtxIsHost = false;
   private audioGain: GainNode | null = null;
-  private audioNextStart = 0;
-  private audioActive = false;
+  // Bluetooth/OS-route keepalive: a hidden, near-silent looping <audio> started across a pause/unload (OWN
+  // ctx only) so the BT/system audio session stays awake — without it the first audio after a pause eats the
+  // ~200 ms BT re-wake gap (a clipped resume). A HOST ctx is app-lifetime + the host owns its route, so the
+  // keepalive is own-ctx-only; stopKeepalive is a harmless no-op when no element was created.
+  private keepaliveEl: HTMLAudioElement | null = null;
+  private keepaliveUrl: string | null = null;
+  private audioActive = false; // mirrors the worker's audioStats.active (audio is the live master clock)
 
-  // ---- live latency-sync (the reference player's start_audio_playout) ----
-  // CLOSED-LOOP media clock: a small FIFO of in-flight scheduled segments {ws: ctx wall_start, media:
-  // media seconds, rate}, each valued at ITS OWN rate so a rate-heterogeneous queue is never revalued
-  // at a single scalar (which would step the clock at every rate change). `mediaBase` = media of
-  // segments already fully played (popped). elapsed = mediaBase + (ctx.now − ws_front)·rate_front. The
-  // FIFO + mediaBase stay MONOTONIC across an underrun (the underrun re-anchors the SCHEDULE cursor, not
-  // the clock) so the published A_ACLOCK never jumps backward under the present worker — see playAudio.
-  private segQ: { ws: number; media: number; rate: number }[] = [];
-  private mediaBase = 0;
-  private liveSyncStalls = 0;       // underruns observed → relax the target (stall_count)
-  private liveSyncSmoothChunks = 0; // smooth chunks since the last stall → decays the stall count
-  private liveSyncHoldChunks = 0;   // chunks left forcing rate=1.0 (post resume/underrun resync)
-  private liveSyncLastRate = 1;     // throttle the debug breadcrumb to rate CHANGES
-  // Audio-health instrument (the clock is audio-locked → a sparse/underrunning audio track stutters the
-  // clock). UNCAPPED + liveSync-independent, unlike liveSyncStalls (which clamps as a target-relax signal).
-  private audioUnderruns = 0;       // cumulative audio playout underruns (scheduled audio fell behind ctx.currentTime)
-  private audioGapSecs = 0;         // cumulative inserted silence across those underruns (s) — the audible playout gap
-  // Cumulative audio chunks DROPPED because the scheduled-ahead reservoir was already at
-  // the liveSyncMaxLatency cap (the symmetric upper bound to policy.ts's lower-target relax). Caps the
-  // reservoir + the in-flight node count so the main thread can't be buried under a growing node queue.
-  private audioDrops = 0;
-  // publishClock cadence instrument — detects a main-thread stall. The setInterval is
-  // armed for CLOCK_PUBLISH_MS (10ms); a tick GAP ≫ 10ms means main was BLOCKED (couldn't fire the
-  // timer) → the SAB clock froze → present starved. Reported ~1/s via Events.LOG → /pumplog.
-  private cpLastAt = 0;             // perf.now() of the previous publishClock tick (0 = not yet seen)
-  private cpMaxGap = 0;             // max inter-tick gap (ms) since the last report
-  private cpReportAt = 0;           // perf.now() of the last [clock] report
-  // latency-to-live proxy (s): the scheduled-ahead audio reservoir — exactly the signal the
-  // live-sync rate chaser treats as "how far behind the live edge we are." Updated per audio chunk.
-  private liveLatencySecs = 0;
-  // ---- loudness AGC state (RMS-dBFS → makeup gain; see playAudio/measureLoudness/applyGain) ----
-  // Levels wildly-varying sources (loud ads vs quiet dialogue) by nudging the LONG-TERM loudness toward
-  // AGC_TARGET_DB via a slow EWMA + a peak-capped, asymmetric makeup gain folded into audioGain alongside
-  // volume/mute. Engine-independent (operates on the delivered PCM) → works on every codec + both tiers.
-  private agcLoudnessMs = 0;   // EWMA of mean-square (linear power); 0 = unseeded
-  private agcPeak = 0;         // decaying windowed peak (linear) — caps the makeup so a boost can't clip
+  // ---- the PCM ring SAB (producer = decode worker, consumer = the AudioWorklet) ----
+  // MAIN allocates + SEEDS it (it can read the control slots for telemetry — underruns/depth), then hands
+  // the producer side to the decode worker (audioSetPcmRing) and the same SAB to the worklet (processor-
+  // Options.ring). MAIN never writes the data region nor the producer cursors; it owns only RW_PLAYING.
+  private audioRingSab: SharedArrayBuffer | null = null;
+  private audioRingCtrl: Int32Array | null = null;  // the control header (Atomics) — telemetry + RW_PLAYING
+  private videoPktCtrl: Int32Array | null = null;   // the video packet-ring control view — PR_DROPS telemetry
+  private audioPktCtrl: Int32Array | null = null;   // the audio packet-ring control view — PR_DROPS telemetry
+  private audioRingData: Float32Array | null = null; // interleaved-stereo data (worklet+worker own it; held for parity)
+  private audioRingCap = 0;        // ring capacity in FRAMES (per channel)
+  private audioRingGen = 0;        // load generation seeded into RW_GEN — the worklet drops a stale producer epoch
+  private audioRingInstance = 0;   // monotonic ensure_audio counter — the spawnWorklet validity guard keys on it
+  private audioWorklet: AudioWorkletNode | null = null;
+
+  // ---- AudioContext interruption recovery (OWN ctx only) ----
+  private audioResumeTimer: ReturnType<typeof setTimeout> | 0 = 0;
+  private audioRecoveryAttempts = 0;
+  private audioStatechangeHandler: (() => void) | null = null;
+  // HOST ctx only: an addEventListener('statechange') listener (NOT ctx.onstatechange — the host owns that
+  // property for its recovery ladder). Observes the host ctx's cold suspended→running edge so a stale PCM
+  // backlog (worklet.process didn't run while suspended) is dropped via the same live re-arm the own-ctx path
+  // uses. Removed on teardown (the host ctx outlives the player).
+  private hostAudioStatechangeHandler: (() => void) | null = null;
+  private audioPlayAtMs = 0; // perf.now() at the last live play() — gates the resume-edge re-arm (AUDIO_REARM_MIN_DELAY_MS)
+
+  // ---- audio telemetry mirrored from the decode worker's ~2 Hz `audioStats` (feeds getStats + the AGC) ----
+  private audioLoudnessDb = 0;  // reported RMS-dBFS loudness proxy — drives the makeup gain
+  private audioPeak = 0;        // reported windowed peak |sample| — caps the makeup boost so it can't re-clip
+  private audioDrops = 0;       // cumulative audio chunks the worker dropped at the ring cap (the reservoir bound)
+  private audioSrcChannels = 0; // decoded SOURCE channels pre-downmix (6 for EAC3 5.1) — overlay "6→2ch"
+  private audioStreamRate = 0;  // decoded source sample rate (Hz) — overlay "48.0→ctx48.0k"
+  private liveLatencySecs = 0;  // latency-to-live proxy (s) — the worker's scheduledAhead reservoir signal
+  private buffering = false;    // mpv cache-pause: the audio output starved → freeze the clock + present
+  // ---- loudness AGC makeup state (DOM-bound GainNode; the RMS/peak FOLD runs in the worker now) ----
+  // The GainNode composes volume × mute × the loudness makeup. `agcGainDb` is the current makeup in dB
+  // (0 = unity until the first real measurement). update_loudness_gain recomputes it from the worker's
+  // loudnessDb/peak; applyGain folds it into the node with a click-free ramp.
+  private agcGainDb = 0;       // current makeup (dB); 0 = unity (unseeded / no-audio)
   private agcMakeup = 1;       // current makeup multiplier (linear), composed into the gain
 
   constructor(dataSource: MediaDataSource, config?: Partial<FerriteConfig>) {
@@ -275,6 +347,15 @@ export class FerritePlayer {
   static isSupported = isSupported;
 
   // ---- controller lifecycle --------------------------------------------------
+
+  /** Inject a HOST-OWNED, app-lifetime AudioContext (created + gesture-unlocked + recovered by the host —
+   *  see host-audio.ts). The player attaches its per-stream nodes to it and NEVER creates/resumes/closes
+   *  it. Call BEFORE play() (and before ensureAudio); harmless to call repeatedly. Without it, the player
+   *  owns a per-stream context itself (the standalone path), which it resumes on play() + closes on
+   *  teardown. (Mirrors the reference player's attach_audio.) */
+  attachAudio(ctx: AudioContext): void {
+    this.hostAudioCtx = ctx;
+  }
 
   /** mpegts attachMediaElement → attachCanvas divergence: ferrite renders to <canvas>. The canvas
    *  control is TRANSFERRED to the present worker (transferControlToOffscreen) — main never gets a
@@ -310,6 +391,16 @@ export class FerritePlayer {
     // The decode↔present channel: frames go decode→present over it, recycled buffers come back.
     const chan = new MessageChannel();
 
+    // The two PACKET RINGS: alloc on MAIN, hand the SAME SABs BY REFERENCE — the DEMUX worker is the
+    // sole PRODUCER of each (on demuxInit), the AUDIO/VIDEO workers the sole CONSUMERS (on audioInit/init).
+    // Like the clock SAB (NOT transferred — MAIN reads ring depth for telemetry).
+    const audioPacketRing = allocPacketRing(AUDIO_PACKET_RING_BYTES);
+    const videoPacketRing = allocPacketRing(VIDEO_PACKET_RING_BYTES);
+    // Keep a control-region view of each packet ring so getStats() can read the demux's PR_DROPS counter
+    // (the decode-bound diagnostic: a slow software decoder backs up its ring → the demux drops the oldest).
+    this.videoPktCtrl = new Int32Array(videoPacketRing, 0, PR_CTRL_SLOTS);
+    this.audioPktCtrl = new Int32Array(audioPacketRing, 0, PR_CTRL_SLOTS);
+
     // Spawn the PRESENT worker and hand it the OffscreenCanvas + its channel end + the clock SAB + the
     // per-tier ring caps. The `new Worker(new URL('./present-worker.js', import.meta.url), …)` form is
     // kept LITERAL so bundlers detect/copy/rewrite the worker chunk (a hoisted URL defeats it).
@@ -324,8 +415,9 @@ export class FerritePlayer {
       [off, chan.port1],
     );
 
-    // Spawn the DECODE worker and hand it the OTHER channel end (transferred). Frames flow over it to
-    // the present worker; recycled plane buffers come back over it.
+    // Spawn the VIDEO DECODE worker and hand it the OTHER channel end (transferred) + the VIDEO packet ring
+    // CONSUMER end (shared by reference). Frames flow over the port to the present worker; recycled plane
+    // buffers come back over it.
     this.worker = this.cfg.workerUrl
       ? new Worker(this.cfg.workerUrl, { type: 'module' })
       : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
@@ -336,17 +428,62 @@ export class FerritePlayer {
       this.handleFatal(mapFerriteError('worker', -1, 'worker: message deserialization failed', true));
     this.post({
       type: 'init', wasmBaseUrl: this.cfg.wasmBaseUrl, threads: this.threads,
+      isIOS: this.platform.isIOS,
+      isAppleWebKit: this.platform.isAppleWebKit,
+      fastDecode: this.cfg.fastDecode,
+      debug: DEBUG,
+      presentPort: chan.port2,
+      ringCap: this.ringCap, // single source of truth for the worker's software in-flight (credit) bound (?ring)
+      videoPacketRing, // the consumer end of the video AU ring (shared by reference; the demux worker is sole writer)
+    }, [chan.port2]); // only the port is TRANSFERRED; the SABs (clock, videoPacketRing) are shared by reference
+
+    // Spawn the DEMUX worker (its own ferrite realm — ingest/source/demux + BOTH ring producers). It
+    // owns the source URL/isLive/seek/paused (MainToDemux). The `new Worker(new URL('./demux-worker.js', …))`
+    // form is kept LITERAL so bundlers detect/copy/rewrite the worker chunk; cfg.demuxWorkerUrl overrides it.
+    this.demux = this.cfg.demuxWorkerUrl
+      ? new Worker(this.cfg.demuxWorkerUrl, { type: 'module' })
+      : new Worker(new URL('./demux-worker.js', import.meta.url), { type: 'module' });
+    this.demux.onmessage = (e: MessageEvent<DemuxToMain>) => this.onDemuxMessage(e.data);
+    this.demux.onerror = (e: ErrorEvent) =>
+      this.handleFatal(mapFerriteError('worker', -1, `demux-worker: ${e.message} @ ${e.filename}:${e.lineno}`, true));
+    // demuxInit (engine params + BOTH ring producer ends + the adaptive low-water config). Posted immediately —
+    // module workers buffer pre-onmessage posts; the demuxReady gate below sequences the follow-up demuxLoad.
+    this.demuxReady = false;
+    this.demuxOutbox.length = 0;
+    this.postDemux({
+      type: 'demuxInit', wasmBaseUrl: this.cfg.wasmBaseUrl,
       lowWaterFloor: this.cfg.stashInitialSize ?? LOW_WATER_DEFAULT_FLOOR,
       lowWaterCeiling: this.cfg.stashMaxSize,
       lowWaterAdaptive: this.cfg.stashAdaptive,
       isIOS: this.platform.isIOS,
       isAppleWebKit: this.platform.isAppleWebKit,
-      presentPort: chan.port2,
-      ringCap: this.ringCap, // single source of truth for the worker's software in-flight (credit) bound (?ring)
-    }, [chan.port2]);
+      debug: DEBUG,
+      audioPacketRing, videoPacketRing, // both PRODUCER ends (shared by reference; this worker is sole writer of each)
+    }, /* init= */ true);
 
-    // Publish the audio master clock into the SAB on a steady cadence (the present worker reads it).
-    this.clockTimer = setInterval(() => this.publishClock(), CLOCK_PUBLISH_MS);
+    // Spawn the AUDIO worker (its own ferrite realm — audio decode + the PCM-ring producer). The
+    // `new Worker(new URL('./audio-worker.js', import.meta.url), …)` form is kept LITERAL so bundlers
+    // detect/copy/rewrite the worker chunk (a hoisted URL defeats it); cfg.audioWorkerUrl overrides it.
+    this.audio = this.cfg.audioWorkerUrl
+      ? new Worker(this.cfg.audioWorkerUrl, { type: 'module' })
+      : new Worker(new URL('./audio-worker.js', import.meta.url), { type: 'module' });
+    this.audio.onmessage = (e: MessageEvent<AudioToMain>) => this.onAudioMessage(e.data);
+    this.audio.onerror = (e: ErrorEvent) =>
+      this.handleFatal(mapFerriteError('worker', -1, `audio-worker: ${e.message} @ ${e.filename}:${e.lineno}`, true));
+    // audioInit (engine params + the audio packet ring consumer end). The PCM ring follows in audioSetPcmRing
+    // once ensureAudio() allocs it (it sizes off ctx.sampleRate). Posted immediately — module workers buffer
+    // pre-onmessage posts; the audioReady gate below sequences the FOLLOW-UP posts (SetPcmRing/load/codec).
+    this.audioReady = false;
+    this.audioOutbox.length = 0;
+    this.postAudio({
+      type: 'audioInit', wasmBaseUrl: this.cfg.wasmBaseUrl,
+      isIOS: this.platform.isIOS, isAppleWebKit: this.platform.isAppleWebKit, debug: DEBUG,
+      audioPacketRing,
+    }, /* init= */ true);
+
+    // (No main-thread clock publisher: the AudioWorklet is the SOLE writer of the clock SAB — it runs on
+    // the audio render thread and never starves on a main-thread long task. This retired the setInterval
+    // freeze bug.)
 
     // Background-tab pause: a hidden tab keeps burning the decode thread-pool + the present worker's
     // rAF (Chromium does not throttle worker rAF), so auto-pause when hidden, auto-resume when shown —
@@ -385,15 +522,22 @@ export class FerritePlayer {
       return;
     }
     if (!this.url) { this.emitError(mapFerriteError('network', -1, 'no stream url', true)); return; }
+    // Create the AudioContext NOW (starts suspended; play() resumes it on the gesture) so its rate is known
+    // and setAudioOutRate is outboxed BEFORE the audio worker's load below → the worker stores the engine
+    // output rate before it opens the audio decoder, so the first chunks of the FIRST stream don't decode at
+    // passthrough + get browser-resampled on a non-48k device (the opening-chunk rate race). Idempotent; also
+    // means the first-load resetAudioEpoch below operates on a live ring. (Mirrors the reference player's load().)
+    this.ensureAudio();
     // Diagnostic: log the RESOLVED knob config once (the defaults = today's behaviour).
     if (DEBUG && !this.cfgLogged) {
       this.cfgLogged = true;
-      this.emit(Events.LOG, `smoothness knobs resolved: ringCap=${this.ringCap} swRingCap=${this.swRingCap} liveSync=${this.cfg.liveSync}`);
+      this.emit(Events.LOG, `smoothness knobs resolved: ringCap=${this.ringCap} swRingCap=${this.swRingCap}`);
     }
     // Reloading over a prior stream: re-arm the audio epoch + tell the present worker to flush its ring
     // and re-anchor so the new pipeline presents cleanly (no brief flash of the old timeline).
     const gen = ++this.loadGen;
     this.firstFrameSeen = false;
+    this.audioSyncPending = false; // fresh load: play() re-arms the mpv audio_start_ao gate
     // Drive the controller into a live (non-terminal) state so a destroy racing this load transitions
     // through Closing identically (TOTAL). `load` only moves an idle controller; a reload from a live
     // state is inert in the reducer (harmless) — teardown is the same from any state anyway.
@@ -401,21 +545,36 @@ export class FerritePlayer {
     // response lands); the controller transport mode keys on the declared intent (known before any response).
     this._caps = deriveCapabilities(this._isLive);
     this.controller.dispatch({ type: 'load', mode: this._caps.declaredLive ? 'live' : 'vod', url: this.url });
-    this.resetAudioEpoch();
+    this.resetAudioEpoch(false); // (re)load → ResetEpoch (the worker bumps RW_GEN + re-anchors the new pipeline)
+    // Per-stream loudness reset: a reload over a live pipeline (e.g. recover(), no teardown) must re-level from
+    // unity, not inherit the prior stream's AGC gain. (Mirrors the reference player's load().)
+    this.agcGainDb = 0; this.agcMakeup = 1; this.audioLoudnessDb = 0; this.audioPeak = 0; this.applyGain();
     this.resetPresent(gen);
-    this._durationMs = 0; // re-probed by the worker for VOD (stays 0 = Infinity for live)
-    this.post({ type: 'load', gen, url: this.url, isLive: this._isLive, preferWebCodecs: this.cfg.preferWebCodecs });
+    this._durationMs = 0; // re-probed by the demux worker for VOD (stays 0 = Infinity for live)
+    // the DEMUX worker owns the SOURCE (url/isLive/seek/paused) → demuxLoad. The VIDEO worker is
+    // decode-only → its `load` carries only the epoch + isLive (the live-edge bit) + preferWebCodecs (no url).
+    this.postDemux({ type: 'demuxLoad', gen, url: this.url, isLive: this._isLive, preferWebCodecs: this.cfg.preferWebCodecs });
+    this.post({ type: 'load', gen, isLive: this._isLive, preferWebCodecs: this.cfg.preferWebCodecs });
     this.post({ type: 'credit', n: this.ringCap }); // seed the decode budget (software tier; ?ring depth)
+    // Per-load the AUDIO worker re-levels loudness from scratch + runs its pump. The demux relays the resolved
+    // codec params (codecParams) once it opens — the audio worker holds the codec until then.
+    this.postAudio({ type: 'audioLoad', gen, isLive: this._isLive });
   }
 
   /** Stop the current stream pipeline but keep the workers/engine + canvas attached (mpegts unload). */
   unload(): void {
     if (this.destroyed || !this.worker) return;
     const gen = ++this.loadGen;
-    this.post({ type: 'unload', gen });
-    this.resetAudioEpoch();
+    this.postDemux({ type: 'demuxUnload', gen }); // tear down the source + demux (keep the engine)
+    this.post({ type: 'unload', gen });           // tear down the video decoder (keep the engine)
+    this.postAudio({ type: 'audioUnload', gen }); // tear down the audio decoder (keep the engine)
+    this.setRingPlaying(false); // disarm output NOW (synchronous) so a chunk decoded in the unload window
+    // can't keep the worklet draining against a stale clock anchor.
+    this.resetAudioEpoch(false); // live restart/load → ResetEpoch (the worker bumps RW_GEN + re-anchors)
     this.resetPresent(gen);
-    this.audioCtx?.suspend().catch(() => {});
+    // OWN ctx only: hold the route + suspend across the unload (parity with pause()). A HOST ctx stays
+    // running (the worklet is gated above; the host owns its route).
+    if (!this.audioCtxIsHost) { this.startKeepalive(); this.audioCtx?.suspend().catch(() => {}); }
     this._paused = true;
   }
 
@@ -464,11 +623,17 @@ export class FerritePlayer {
    *  the controller drives only teardown at the facade. Running off the command stream is what
    *  makes the ORDER authoritative (encoded in the reducer) instead of scattered across this file. */
   private execCommand(cmd: PlaybackCommand): void {
+    if (cmd.type === 'emit' && cmd.event === 'ended') {
+      // EOF effect: the controller reached Eof → pause + tell the host exactly once (so paused() then agrees).
+      this._paused = true;
+      this.emit(Events.LOADING_COMPLETE);
+      return;
+    }
     if (cmd.type !== 'teardown') return;
     switch (cmd.phase) {
       case 'pipeline': this.teardownPipeline(); break; // DECODE worker: abort source → free decoders → release held → reap pool → terminate
       case 'present':  this.teardownPresent();  break; // PRESENT worker: close ALL VideoFrames + dispose GL → terminate
-      case 'audio':    this.teardownAudio();    break; // MAIN: close the AudioContext (master clock) + stop the clock publisher
+      case 'audio':    this.teardownAudio();    break; // MAIN: disconnect the worklet + own-ctx close (host ctx node-only)
       case 'engine':   this.teardownEngine();   break; // MAIN (on Closed): finalize the baseline (engine died with the decode worker)
     }
   }
@@ -477,6 +642,13 @@ export class FerritePlayer {
    *  SAB wasm instance) and aborts the in-flight source connection + releases all held frames BEFORE
    *  terminate() — the proven internal RAII order (worker.ts handleDestroy). Idempotent (null worker). */
   private teardownPipeline(): void {
+    // FOUR realms. The DEMUX + AUDIO workers are decode realms too (their own ferrite engine), so reap
+    // them in the SAME pipeline phase as the VIDEO worker — all before the AudioContext closes (the audio
+    // phase). The DEMUX worker owns the SOURCE, so abort it FIRST so the in-flight `/proxy` fetch FINs promptly.
+    const dx = this.demux;
+    if (dx) { this.demux = null; this.demuxReady = false; this.demuxOutbox.length = 0; this.shutdownDemux(dx); }
+    const a = this.audio;
+    if (a) { this.audio = null; this.audioReady = false; this.audioOutbox.length = 0; this.shutdownAudio(a); }
     const w = this.worker;
     if (!w) return;
     this.worker = null;
@@ -492,17 +664,97 @@ export class FerritePlayer {
     this.shutdownPresent(p);
   }
 
-  /** OWNER: MAIN. Stop the clock publisher + close the master-clock AudioContext, drop the clock SAB.
-   *  Idempotent (already-closed AudioContext / null refs). */
+  /** OWNER: MAIN. Tear down the audio playout. The AudioWorklet (audio decode is the decode worker; the
+   *  clock is the worklet) is disconnected; an in-flight addModule future is discarded on resolve by the
+   *  spawnWorklet validity guard (audioCtx now null / a fresh ensureAudio bumps the ring instance). An OWN
+   *  per-stream ctx is closed (handler off + close); a HOST ctx is NEVER closed — node-only teardown — and
+   *  its statechange handler is left untouched (the host owns it across the ctx's full lifetime; closing it
+   *  would kill the next stream's audio + break the host's recovery). Keyed on audioCtxIsHost (the ACTIVE
+   *  ctx), so a mis-ordered attach that left us on an OWN ctx still closes that own ctx (no orphan/leak).
+   *  Idempotent (already-closed ctx / null refs). */
   private teardownAudio(): void {
-    if (this.clockTimer) { clearInterval(this.clockTimer); this.clockTimer = 0; }
-    this.audioCtx?.close().catch(() => {});
-    this.audioCtx = null;
+    if (this.audioResumeTimer) { clearTimeout(this.audioResumeTimer); this.audioResumeTimer = 0; }
+    this.audioRecoveryAttempts = 0;
+    this.audioWorklet?.disconnect();
+    this.audioWorklet = null;
+    // Disconnect the per-stream gain explicitly: on a HOST ctx, ctx.close() won't run to release it, so a
+    // connected node would leak (+ keep its AGC ramp) on the shared context. Harmless on the own-ctx path.
+    this.audioGain?.disconnect();
     this.audioGain = null;
+    this.audioRingCtrl = null;
+    this.audioRingData = null;
+    this.audioRingSab = null;
+    this.audioRingCap = 0;
+    const ctx = this.audioCtx;
+    this.audioCtx = null;
+    if (ctx) {
+      if (this.audioCtxIsHost) {
+        // HOST ctx: NEVER close it; leave the host's ctx.onstatechange (its recovery) alone. But DO remove OUR
+        // addEventListener('statechange') running-edge observer — the ctx outlives the player, so a stale
+        // closure would keep firing (+ re-arm) on the next stream's cold start.
+        if (this.hostAudioStatechangeHandler) ctx.removeEventListener('statechange', this.hostAudioStatechangeHandler);
+      } else {
+        ctx.onstatechange = null;
+        ctx.close().catch(() => {});
+      }
+    }
+    this.hostAudioStatechangeHandler = null;
+    this.audioCtxIsHost = false;
+    this.audioStatechangeHandler = null;
     this.audioActive = false;
-    this.agcLoudnessMs = 0; this.agcPeak = 0; this.agcMakeup = 1; // fresh leveller for the next load
+    this.agcGainDb = 0; this.agcMakeup = 1; this.audioLoudnessDb = 0; this.audioPeak = 0; // fresh leveller for the next load
+    // Stop + release the BT keepalive element and revoke its object URL (no leak across teardown).
+    if (this.keepaliveEl) { try { this.keepaliveEl.pause(); } catch { /* detached */ } this.keepaliveEl = null; }
+    if (this.keepaliveUrl) { try { URL.revokeObjectURL(this.keepaliveUrl); } catch { /* already revoked */ } this.keepaliveUrl = null; }
     this.clock = null;
     this.clockSab = null;
+  }
+
+  /** Build a 0.5 s, 8 kHz, mono, 8-bit-PCM silence WAV as a blob: URL — the BT/OS-route keepalive source.
+   *  8-bit unsigned PCM silence = 0x80. Tiny (≈4 KB); inaudible at volume 0.0001 but enough to hold the
+   *  audio session. Returns null if the Blob/URL APIs are unavailable (non-fatal). */
+  private makeSilentWavUrl(): string | null {
+    try {
+      const SR = 8000, N = SR / 2; // 0.5 s
+      const buf = new Uint8Array(44 + N);
+      const dv = new DataView(buf.buffer);
+      const wr = (o: number, s: string): void => { for (let i = 0; i < s.length; i++) buf[o + i] = s.charCodeAt(i); };
+      wr(0, 'RIFF'); dv.setUint32(4, 36 + N, true); wr(8, 'WAVE'); wr(12, 'fmt ');
+      dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); // PCM, mono
+      dv.setUint32(24, SR, true); dv.setUint32(28, SR, true); // sample rate, byte rate (8-bit mono)
+      dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);   // block align, bits/sample
+      wr(36, 'data'); dv.setUint32(40, N, true);
+      buf.fill(0x80, 44); // 8-bit unsigned PCM silence
+      return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+    } catch { return null; }
+  }
+
+  /** Lazily build the hidden silent looping <audio> that holds the BT/OS audio route awake. */
+  private ensureKeepalive(): HTMLAudioElement | null {
+    if (!this.keepaliveEl) {
+      const url = this.makeSilentWavUrl();
+      if (!url) return null;
+      try {
+        const el = new Audio();
+        el.src = url; el.loop = true; el.preload = 'auto'; el.volume = 0.0001; // inaudible but holds the session
+        this.keepaliveUrl = url;
+        this.keepaliveEl = el;
+      } catch { try { URL.revokeObjectURL(url); } catch { /* ignore */ } return null; }
+    }
+    return this.keepaliveEl;
+  }
+
+  /** Hold the audio route across a pause/unload (OWN ctx only). Autoplay policy may block play() without a
+   *  gesture — harmless (the user already interacted to start playback); the promise is fire-and-forget. */
+  private startKeepalive(): void {
+    const el = this.ensureKeepalive();
+    if (el) el.play().catch(() => { /* autoplay-blocked / detached — non-fatal */ });
+  }
+
+  /** The main context is taking the audio session back (play/seek) → release the keepalive. No-op when no
+   *  element was created (the host-ctx path never starts it). */
+  private stopKeepalive(): void {
+    if (this.keepaliveEl) { try { this.keepaliveEl.pause(); this.keepaliveEl.currentTime = 0; } catch { /* detached */ } }
   }
 
   /** OWNER: MAIN, on Closed. The engine memory is freed when the decode worker terminates. FIX 2: this no
@@ -519,7 +771,7 @@ export class FerritePlayer {
     this.presentIntervalMs = this.presentIntervalP95Ms = this.presentIntervalMaxMs = this.presentStutters = this.presentSeamGaps = 0;
     this.clockAdvanceFps = this.clockRateRatio = this.clockResidualMs = this.rafFps = this.presentDropsPerSec = 0;
     this.vsyncIntervalMs = this.displayHz = this.cadenceHoldMean = this.cadenceHold2Frac = this.cadenceErrorMs = this.syncResyncsPerSec = 0;
-    this.cadenceTier = 1; this.cadenceDrawRate = 0; this.cadenceDegradeReason = 0; this.cadenceRung = 0;
+    this.cadenceTier = 1; this.cadenceDrawRate = 0; this.cadenceDegradeReason = 0; this.cadenceRung = 0; this.cadenceDropToKey = 0;
     this.presentRingCap = this.swRingCap; // the resolved per-instance cap (knobs survive a detach/re-load)
     this.notIsolated = false;
     this.engineDead = false;      // a fresh attachCanvas spawns new workers that may load fine
@@ -590,6 +842,46 @@ export class FerritePlayer {
     try { p.postMessage({ type: 'destroy' } as MainToPresent); } catch { finish(); }
   }
 
+  /** Drive the AUDIO worker's destroy handshake then terminate it. It frees its decoder + reaps its (small)
+   *  pthread pool BEFORE acking `destroyed` (the same RAII order as the decode worker), so main can terminate
+   *  with no orphaned threads. A timeout guarantees an unresponsive worker is still terminated. */
+  private shutdownAudio(a: Worker): void {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | 0 = 0;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      a.onmessage = null;
+      a.onerror = null;
+      a.terminate();
+    };
+    a.onmessage = (e: MessageEvent<AudioToMain>) => { if (e.data?.type === 'destroyed') finish(); };
+    a.onerror = finish; // worker crashed → nothing left to reap, just terminate
+    timer = setTimeout(finish, WORKER_SHUTDOWN_TIMEOUT_MS); // must exceed the worker's READY_SETTLE_MS + reap
+    try { a.postMessage({ type: 'audioDestroy' } as MainToAudio); } catch { finish(); }
+  }
+
+  /** Drive the DEMUX worker's destroy handshake then terminate it. It aborts its source + frees its demux
+   *  BEFORE acking `destroyed` (ferritePool=0 → no pthread pool to reap). A timeout guarantees an unresponsive
+   *  worker is still terminated. */
+  private shutdownDemux(dx: Worker): void {
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | 0 = 0;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      if (timer) clearTimeout(timer);
+      dx.onmessage = null;
+      dx.onerror = null;
+      dx.terminate();
+    };
+    dx.onmessage = (e: MessageEvent<DemuxToMain>) => { if (e.data?.type === 'destroyed') finish(); };
+    dx.onerror = finish; // worker crashed → nothing left to reap, just terminate
+    timer = setTimeout(finish, WORKER_SHUTDOWN_TIMEOUT_MS); // must exceed the worker's READY_SETTLE_MS
+    try { dx.postMessage({ type: 'demuxDestroy' } as MainToDemux); } catch { finish(); }
+  }
+
   /** Full teardown. The HOST owns lifecycle policy; the player has NO internal idle-pause watchdog. */
   destroy(): void {
     if (this.destroyed) return;
@@ -614,18 +906,28 @@ export class FerritePlayer {
     if (this.destroyed || !this.worker) return Promise.resolve();
     this.controller.dispatch({ type: 'userPlay' });  // paused → playing (inert from other states)
     this.bgPaused = false; // a manual play takes ownership of the play/pause state
+    this.audioPlayAtMs = performance.now(); // resume-edge re-arm delay gate (AUDIO_REARM_MIN_DELAY_MS)
+    this.audioSyncPending = !this.firstFrameSeen; // arm the mpv audio_start_ao gate (cleared once video reaches apts)
     this.ensureAudio();
     if (this._caps.hasLiveEdge) {
-      // LIVE resync to the edge: re-arm the audio epoch, tell the present worker to drop the stale ring
-      // + re-anchor, and tell the decode worker to await the next keyframe. (No-ops on the initial play.)
-      this.resetAudioEpoch();
+      // LIVE resync to the edge: re-arm the audio epoch (the worker snaps the ring to the live head) +
+      // tell the present worker to drop the stale ring + re-anchor. (No-ops on the initial play.)
+      this.resetAudioEpoch(false);
       this.resetPresent(this.loadGen);
-      this.liveSyncHoldChunks = LIVE_SYNC_RESUME_HOLD_CHUNKS;
     }
-    // VOD: resume in place — the present worker keeps its decoded-ahead ring + clock.
-    if (this.audioCtx?.state === 'suspended') this.audioCtx.resume().catch(() => {});
+    // OWN ctx only: resume it here. A HOST ctx is resumed by the host on a real user gesture (the player
+    // never resumes it — see attachAudio). The worklet is un-gated below regardless via setRingPlaying.
+    if (!this.audioCtxIsHost && this.audioCtx?.state === 'suspended') this.audioCtx.resume().catch(() => {});
+    this.stopKeepalive(); // the main context is taking the audio session back
     this._paused = false;
-    this.post({ type: 'setPaused', paused: false });
+    // Release audio NOW only if the gate's conditions are already met (video-only/audio-only escape, or the video
+    // clock has already passed the audio start); else it stays WITHHELD, re-checked from the present Time tick +
+    // decode Ready. A RESUME (audioSyncPending was false) un-gates immediately, unless something else withholds.
+    if (this.audioSyncPending) this.maybeStartAudioAo();
+    else this.setRingPlaying(!this.internalPaused());
+    this.postDemux({ type: 'demuxSetPaused', paused: false }); // un-gate the source (the demux owns it now)
+    this.post({ type: 'setPaused', paused: false });           // the video worker re-arms the resume IDR
+    this.postAudio({ type: 'audioSetPaused', paused: false }); // un-gate the audio producer (writePcmChunk)
     this.postPresent({ type: 'setPaused', paused: false });
     return Promise.resolve();
   }
@@ -635,9 +937,19 @@ export class FerritePlayer {
     this.controller.dispatch({ type: 'userPause' }); // playing → paused (inert from other states)
     this.bgPaused = false; // a manual pause takes ownership (the visHandler re-sets it if it called us)
     this._paused = true;
-    this.post({ type: 'setPaused', paused: true });       // worker tracks live edge, discards
+    this.audioSyncPending = false; // a deliberate pause cancels a pending audio_start_ao sync; a later play re-arms
+    // Flip RW_PLAYING=0 BEFORE suspending: the worklet then emits silence + HOLDS the read cursor (clock
+    // frozen) and releases C_AUDIO on its next quantum — so the present worker stops seeing the audio clock
+    // advance the instant we pause, not after the suspend lands.
+    this.setRingPlaying(false);
+    this.postDemux({ type: 'demuxSetPaused', paused: true }); // the demux tracks the live edge, discards
+    this.post({ type: 'setPaused', paused: true });           // the video worker skips until the next IDR on resume
+    this.postAudio({ type: 'audioSetPaused', paused: true }); // gate the audio producer (writePcmChunk no-ops)
     this.postPresent({ type: 'setPaused', paused: true }); // present worker freezes the clock + eviction
-    this.audioCtx?.suspend().catch(() => {});              // freezes the master clock
+    // OWN ctx only: hold the BT/OS route + suspend across the pause. A HOST ctx is shared + app-lifetime →
+    // leave it running (the worklet is already gated above via RW_PLAYING); suspending it would fight the
+    // host's recovery and silence any other consumer of the shared context.
+    if (!this.audioCtxIsHost) { this.startKeepalive(); this.audioCtx?.suspend().catch(() => {}); }
   }
 
   /** Seek to `seconds` — only on a SEEKABLE source (Range/206). Ignored on a non-seekable source (a live
@@ -648,16 +960,24 @@ export class FerritePlayer {
     let t = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
     const dur = this._durationMs > 0 ? this._durationMs / 1000 : null;
     if (dur !== null) t = Math.min(t, Math.max(0, dur - 0.1)); // clamp inside the file
-    this.resetAudioEpoch();
-    this.resetPresent(this.loadGen);
+    // VOD seek: flush + seek-block the audio ring (NO early rebase) so a still-buffered pre-seek packet
+    // can't anchor C_ACLOCK to the old position — the first post-seek chunk arms the rebase. (seek=true.)
+    this.resetAudioEpoch(true);
+    this.resetPresent(this.loadGen, t * 1000); // VOD seek → arm the present seek-hold at the target (mpv last_seek_pts)
     this._currentMs = t * 1000;
-    this.post({ type: 'seek', targetMs: t * 1000 });
+    this.postDemux({ type: 'demuxSeek', targetMs: t * 1000 }); // the demux owns the source + seek transport
     // Ensure the clock + audio can advance from the new position (resume; covers replay-after-end).
     this.bgPaused = false;
     this.ensureAudio();
-    if (this.audioCtx?.state === 'suspended') this.audioCtx.resume().catch(() => {});
+    // OWN ctx only: the host resumes a host ctx on a gesture; the player never resumes it.
+    if (!this.audioCtxIsHost && this.audioCtx?.state === 'suspended') this.audioCtx.resume().catch(() => {});
+    this.stopKeepalive(); // the main context is taking the audio session back
     this._paused = false;
+    this.setRingPlaying(true); // a seek while paused (RW_PLAYING=0) leaves the worklet not draining → the
+    // audio decoder backpressures and never produces the post-seek chunk that re-anchors C_ACLOCK.
+    this.postDemux({ type: 'demuxSetPaused', paused: false }); // un-gate the source so it demuxes the post-seek segment
     this.post({ type: 'setPaused', paused: false });
+    this.postAudio({ type: 'audioSetPaused', paused: false }); // un-gate the audio producer so it decodes the post-seek chunk
     this.postPresent({ type: 'setPaused', paused: false });
     this.emit(Events.TIME_UPDATE, t);
   }
@@ -734,6 +1054,7 @@ export class FerritePlayer {
       cadenceDrawRate: this.cadenceDrawRate,
       cadenceDegradeReason: this.cadenceDegradeReason,
       cadenceRung: this.cadenceRung,
+      cadenceDropToKey: this.cadenceDropToKey,
       // levers: the EFFECTIVE combo (manual OR auto graceful-degradation), so perf (benchlog) +
       // smoothness (buildlog) line up by combo AND the buildlog shows present-cap+skip-non-ref+skip-loop flipping on together at the
       // auto-degrade moment. present-cap effective = the manual present=half OR the present worker's auto-latched tier
@@ -764,19 +1085,45 @@ export class FerritePlayer {
       vodConnections: ws?.vodConnections ?? 0,
       vodReopens: ws?.vodReopens ?? 0,
       vodDegraded: ws?.vodDegraded ?? 0,
-      syncedToAudio: this.audioActive,
-      audioQueue: this.segQ.length,
+      // syncedToAudio: the worklet (sole clock writer) flags C_AUDIO=1 while audio is the live master clock
+      // (it releases it to 0 on pause/underrun/no-audio) — read it straight from the clock SAB, AND require
+      // the worker's audioActive (a stale C_AUDIO can't claim sync after the worker degraded to video-only).
+      syncedToAudio: this.audioActive && !!this.clock && Atomics.load(this.clock, C_AUDIO) > 0,
+      // audioQueue: the in-flight audio reservoir depth (frames buffered in the ring = write − read), the
+      // off-main analog of the retired segQ FIFO depth.
+      audioQueue: this.audioRingReadableFrames(),
       // Audio health (the clock is audio-locked → underruns/sparse audio stutter the present clock).
-      audioUnderruns: this.audioUnderruns,
-      audioGapSecs: this.audioGapSecs,
+      // audioUnderruns now comes from the worklet's RW_UNDERRUNS slot (render quanta that found the ring
+      // empty); audioGapSecs is retired (the free-running worklet skips the gap rather than inserting timed
+      // silence, so there is no per-underrun gap-seconds tally) → 0; audioDrops is the worker's reservoir-cap
+      // drop count from audioStats.
+      audioUnderruns: this.audioRingCtrl ? Atomics.load(this.audioRingCtrl, RW_UNDERRUNS) : 0,
+      audioGapSecs: 0,
       audioDrops: this.audioDrops,
-      speed: this.liveSyncLastRate,
-      liveSyncStalls: this.liveSyncStalls,
+      // Decode-bound diagnostics: PR_DROPS from each packet ring (the demux dropped the oldest AU because the
+      // consumer fell behind — a slow software video decode backs up its ring), + the A/V lip-sync error.
+      videoRingDrops: this.videoPktCtrl ? Atomics.load(this.videoPktCtrl, PR_DROPS) : 0,
+      audioRingDrops: this.audioPktCtrl ? Atomics.load(this.audioPktCtrl, PR_DROPS) : 0,
+      avDiffMs: this.avDiffMs(),
+      buffering: this.buffering ? 1 : 0, // mpv cache-pause: 1 while the audio output is rebuffering (clock frozen)
+      // speed: audio plays at 1.0× (the live-sync playbackRate chaser is retired; latency is bounded by the
+      // ring drop-to-live, not by stretching audio), so the master clock runs at realtime.
+      speed: 1,
       // recovery counters (un-stubbed): reconnects/stalls are the decode worker's authoritative
-      // tallies (the error controller's recovery path); latencyToLive is main's reservoir proxy.
+      // tallies (the error controller's recovery path); latencyToLive is the worker's reservoir proxy.
       reconnects: ws?.reconnects ?? 0,
       stalls: ws?.stalls ?? 0,
       latencyToLive: this.liveLatencySecs,
+      audioScheduledAhead: this.liveLatencySecs, // reservoir depth (s) audio is scheduled ahead of ctx time
+      // Audio-path overlay telemetry (a.buf / a.sync rows): source→output downmix, stream-vs-ctx sample rate,
+      // the applied makeup gain + measured loudness, and the live buffer target the reservoir converges toward.
+      audioSrcChannels: this.audioSrcChannels,
+      audioOutChannels: RING_CHANNELS,
+      audioStreamRate: this.audioStreamRate,
+      audioCtxRate: this.audioCtx?.sampleRate ?? 0,
+      audioGainDb: this.agcGainDb,
+      audioLoudnessDb: this.audioLoudnessDb,
+      targetLatency: LIVE_TARGET_LATENCY_SECS,
       // AUTHORITATIVE teardown counters. TWO provenances (FIX 2):
       //  - workers/audioContexts are read LIVE from main's own resource handles → 0 the instant the owner
       //    method nulls them synchronously (no async confirmation needed; main owns these directly).
@@ -784,13 +1131,19 @@ export class FerritePlayer {
       //    openVideoFrames from the present worker's `destroyed` ack (which zeroes presentRing). These are
       //    OWNER-CONFIRMED, not main-zeroed — so a residual connection / held frame / open VideoFrame
       //    surfaces here non-zero and the leak gate FAILS (the assertions are no longer vacuous).
-      workers: (this.worker ? 1 : 0) + (this.present ? 1 : 0),
+      workers: (this.worker ? 1 : 0) + (this.present ? 1 : 0) + (this.audio ? 1 : 0) + (this.demux ? 1 : 0),
       audioContexts: this.audioCtx ? 1 : 0,
       connections: ws?.connections ?? 0, // decode worker owns the connection; confirmed 0 in its final stats
       // Un-closed WebCodecs VideoFrames pin the HW output pool — they live in the present ring on the WC
       // tier; on software the ring holds heap-slot tokens (no VideoFrames), so this is genuinely 0. The
       // present worker's destroyed-ack confirms the ring emptied (presentRing → 0) after it close()d them.
       openVideoFrames: this._tier === 'webcodecs' ? this.presentRing : 0,
+      // Controller playback-state name (idle/opening/buffering/playing/paused/reconnecting/closing/closed).
+      // A STABLE string a host maps to its own UI status (e.g. loading vs active vs ended) without polling
+      // events — surfaced so the host never gets stuck on "loading" when playback is actually progressing.
+      // Normalize the controller's internal 'eof' to the stable host string 'ended' (the host never sees the
+      // internal name); every other state passes through (the host maps loading/active/ended itself).
+      state: this.controller.name === 'eof' ? 'ended' : this.controller.name,
     };
   }
 
@@ -826,7 +1179,7 @@ export class FerritePlayer {
    *  No-op after destroy(); silently no-ops against an engine wasm that predates the setter. */
   setDrc(mode: number): void {
     if (this.destroyed) return;
-    this.post({ type: 'setDrc', mode });
+    this.postAudio({ type: 'setDrc', mode }); // audio is decoded in the audio worker
   }
 
   get volume(): number { return this._volume; }
@@ -840,41 +1193,39 @@ export class FerritePlayer {
     this.applyGain();
   }
 
-  /** Fold volume × mute × AGC makeup into the master gain. `ramp` glides over AGC_RAMP_TC_S (the per-chunk
-   *  AGC update, no zipper noise); a user volume/mute change snaps. The makeup defaults to 1 (unity) until
-   *  the AGC has integrated a loudness estimate, so this is a no-op leveller for the first chunks. */
-  private applyGain(ramp = false): void {
+  /** Fold volume × mute × the loudness makeup into the master gain, ramped via setTargetAtTime (click-free).
+   *  One place so volume, mute, and the AGC compose instead of clobbering each other. `tc` = the ramp time
+   *  constant (short for a user volume/mute snap, longer for the makeup glide). The makeup is unity until the
+   *  worker reports a real loudness, so this is a no-op leveller for the first stats. (Mirrors the reference player's
+   *  apply_audio_gain.) */
+  private applyGain(tc = 0): void {
     const g = this.audioGain;
     if (!g) return;
+    this.agcMakeup = this.agcGainDb !== 0 ? Math.pow(10, this.agcGainDb / 20) : 1;
     const target = this._muted ? 0 : this._volume * this.agcMakeup;
-    if (ramp && this.audioCtx) g.gain.setTargetAtTime(target, this.audioCtx.currentTime, AGC_RAMP_TC_S);
+    if (tc > 0 && this.audioCtx) g.gain.setTargetAtTime(target, this.audioCtx.currentTime, tc);
     else g.gain.value = target;
   }
 
-  /** Loudness AGC (the reference player's RMS-dBFS → makeup-gain leveller). Integrates this chunk's
-   *  mean-square into a slow EWMA (≈AGC_LOUDNESS_TAU_S) + a decaying peak (≈AGC_PEAK_TAU_S), then derives a
-   *  peak-capped, asymmetric makeup that nudges the long-term loudness toward AGC_TARGET_DB. Updates
-   *  `agcMakeup`; the caller applies it via applyGain(true). Engine-independent (operates on the delivered
-   *  interleaved PCM) → levels every codec on both tiers. Near-silent chunks hold the estimate. */
-  private measureLoudness(interleaved: Float32Array, channels: number, sampleRate: number): void {
-    const n = interleaved.length;
-    if (n === 0 || sampleRate <= 0 || channels <= 0) return;
-    let sumSq = 0, peak = 0;
-    for (let i = 0; i < n; i++) { const s = interleaved[i]; sumSq += s * s; const a = s < 0 ? -s : s; if (a > peak) peak = a; }
-    const meanSq = sumSq / n;                       // mean power over all samples (channel-agnostic)
-    const chunkSecs = (n / channels) / sampleRate;  // n = frames·channels → frames/rate = chunk duration
-    // Decaying windowed peak (caps the boost so a quiet-but-spiky source can't be lifted into clipping).
-    this.agcPeak = Math.max(peak, this.agcPeak * Math.exp(-chunkSecs / AGC_PEAK_TAU_S));
-    if (meanSq < AGC_SILENCE_GATE) return; // (near-)silence → hold the loudness estimate + last makeup
-    // Slow EWMA of the loudness power (long tau → tracks programme level, not transients).
-    const alpha = Math.min(chunkSecs / AGC_LOUDNESS_TAU_S, 1);
-    this.agcLoudnessMs = this.agcLoudnessMs <= 0 ? meanSq : this.agcLoudnessMs + alpha * (meanSq - this.agcLoudnessMs);
-    const loudnessDb = 10 * Math.log10(this.agcLoudnessMs);
-    // Peak-aware upper bound: never boost beyond what keeps the windowed peak ≤ full scale.
-    const peakCapDb = this.agcPeak > 0 ? -20 * Math.log10(this.agcPeak) : Infinity;
-    const upper = Math.max(-AGC_MAX_CUT_DB, Math.min(AGC_MAX_BOOST_DB, peakCapDb));
-    const makeupDb = Math.max(-AGC_MAX_CUT_DB, Math.min(upper, AGC_TARGET_DB - loudnessDb));
-    this.agcMakeup = Math.pow(10, makeupDb / 20);
+  /** AGC makeup gain (MAIN side — the GainNode is DOM/AudioContext-bound, so it stays here while the RMS/peak
+   *  FOLD runs in the decode worker where the PCM lives). Driven by the worker's reported loudnessDb/peak
+   *  (~2 Hz): normalize toward AGC_TARGET_DB, asymmetrically clamped, peak-capped (mpv ReplayGain clip-
+   *  prevention: cap the boost at −20·log10(peak) dB so the loudest recent sample can't be pushed past the
+   *  ±1 WebAudio hard-clip). `measured` gates unity until the first real measurement so a fresh stream never
+   *  starts at a stale gain. Re-applies the GainNode only on a ≥0.1 dB move (no per-tick zipper/churn).
+   *  (Mirrors the reference player's update_loudness_gain.) */
+  private updateLoudnessGain(measured: boolean): void {
+    let newDb: number;
+    if (!measured) {
+      newDb = 0; // not yet measured → unity makeup
+    } else {
+      const peakCapDb = this.audioPeak > 0 ? -20 * Math.log10(this.audioPeak) : Infinity;
+      const upper = Math.max(-AGC_MAX_CUT_DB, Math.min(AGC_MAX_BOOST_DB, peakCapDb));
+      newDb = Math.max(-AGC_MAX_CUT_DB, Math.min(upper, AGC_TARGET_DB - this.audioLoudnessDb));
+    }
+    if (Math.abs(newDb - this.agcGainDb) < AGC_GAIN_EPS_DB) return; // negligible — don't reschedule a ramp
+    this.agcGainDb = newDb;
+    this.applyGain(AGC_RAMP_TC_S);
   }
 
   // ---- typed event bus (mpegts on/off; listeners receive variadic args) -------
@@ -910,31 +1261,134 @@ export class FerritePlayer {
   /** Tell the present worker to flush its ring (recycle software buffers / close VideoFrames) and
    *  re-anchor a fresh timeline. Sent on (re)load / unload / seek / live-resume — exactly where main
    *  used to recycleRing()+resetClock() when present was colocated. */
-  private resetPresent(gen: number): void {
-    this.postPresent({ type: 'reset', gen });
+  private resetPresent(gen: number, seekTargetMs = -1): void {
+    this.postPresent({ type: 'reset', gen, hasLiveEdge: this._caps.hasLiveEdge, isLive: this._isLive, seekTargetMs });
   }
 
-  /** Re-arm the audio epoch (master clock): drop the in-flight segment FIFO + media accounting, reset
-   *  the latency-sync state, and ZERO the published clock so the present worker holds until the new
-   *  audio re-seeds it. */
-  private resetAudioEpoch(): void {
+  /** internal_paused (mpv get_internal_paused): the SINGLE source RW_PLAYING=1 composes from, so the gating
+   *  booleans can't disagree across call sites — a USER pause, a cache-pause (`buffering`), OR a still-pending
+   *  mpv audio_start_ao sync each withholds output. */
+  private internalPaused(): boolean {
+    return this._paused || this.buffering || this.audioSyncPending;
+  }
+
+  /** Decoded-PCM ring depth in SECONDS ((write − read) / rate) — the mpv "AO buffer fill" the startup prefill
+   *  gate reasons about. 0 if the ring/rate isn't up yet (so the gate simply keeps waiting). */
+  private pcmDepthSecs(): number {
+    const c = this.audioRingCtrl;
+    if (!c) return 0;
+    const rate = Atomics.load(c, RW_RATE);
+    if (rate <= 0) return 0;
+    return Math.max(0, Atomics.load(c, RW_WRITE) - Atomics.load(c, RW_READ)) / rate;
+  }
+
+  /** Absolute heard-audio PTS (ms) at the worklet read cursor — the `apts` mpv audio_start_ao (playing_audio_pts)
+   *  reasons about. Read straight from the PCM ring's seqlock edge map the AUDIO worker publishes, minus the
+   *  device outputLatency, so it is the TRUE AUDIBLE position. `published` = RW_EPOCH_SEQ != 0 (NOT edge_frame<=0
+   *  — the FIRST chunk anchors at edge_frame==0, so an edge_frame guard would wrongly reject it). NaN until an
+   *  edge is published. */
+  private audioHeardPtsAbsMs(): number {
+    const c = this.audioRingCtrl;
+    if (!c) return Number.NaN;
+    const rate = Atomics.load(c, RW_RATE);
+    let base = 0, edgeFrame = 0, edgePts = 0, published = false;
+    for (let t = 0; t < 4; t++) {
+      const s1 = Atomics.load(c, RW_EPOCH_SEQ);
+      if (s1 & 1) continue; // mid-publish
+      const b = Atomics.load(c, RW_BASE_MS), ef = Atomics.load(c, RW_EDGE_FRAME), ep = Atomics.load(c, RW_EDGE_PTS_MS);
+      if (Atomics.load(c, RW_EPOCH_SEQ) === s1) { base = b; edgeFrame = ef; edgePts = ep; published = s1 !== 0; break; }
+    }
+    if (rate <= 0 || !published) return Number.NaN;
+    const read = Atomics.load(c, RW_READ);
+    // base + edge_pts − (edge_frame − read)/rate·1000 (the audio_ring formula) − outputLatency.
+    return base + edgePts - (edgeFrame - read) * 1000 / rate - this.outputLatencyMs;
+  }
+
+  /** Read AudioContext.outputLatency (the out-of-ring device-buffer delay) and publish it, in ms, to the clock
+   *  SAB's C_OUTPUT_LATENCY_MS slot AND cache it for the audio_start_ao gate — so the master clock reflects the
+   *  TRUE AUDIBLE position (mpv ao_get_delay). 0/absent until the ctx is `running` / on platforms without it →
+   *  0 ms ⇒ NO compensation. Call when the ctx (re)reaches running. */
+  private publishOutputLatency(): void {
+    const lat = this.audioCtx ? (this.audioCtx as unknown as { outputLatency?: number }).outputLatency : undefined;
+    const secs = typeof lat === 'number' && Number.isFinite(lat) && lat > 0 ? lat : 0;
+    this.outputLatencyMs = secs * 1000;
+    if (this.clockSab) Atomics.store(new Int32Array(this.clockSab), C_OUTPUT_LATENCY_MS, Math.round(this.outputLatencyMs));
+  }
+
+  /** mpv audio_start_ao + get_sync_pts — release the WITHHELD audio output once mpv's conditions are met, so
+   *  audio never leads video. Audio starts when: there is no audio to withhold (video-only) or no video to sync
+   *  to (audio-only), OR the video clock has reached the audio first-sample PTS (current_ms >= apts) AND the PCM
+   *  ring has PREFILLED to mpv's STATUS_READY cushion (AUDIO_PREFILL_SECS). No timeout — the wait ends on a real
+   *  video event, never a wall-clock cap. Idempotent; called from play(), the present time tick, and decode ready. */
+  private maybeStartAudioAo(): void {
+    if (!this.audioSyncPending || this._paused) return;
+    // mpv get_sync_pts: sync_to_video only if there IS a video stream. Codec unknown (no `ready` yet) ⇒ assume
+    // both present + keep waiting — the ready handler re-checks the instant it is known.
+    const hasVideo = !this._workerInfo || this._workerInfo.videoCodec > 0;
+    const hasAudio = !this._workerInfo || this._workerInfo.audioCodec > 0;
+    let start: boolean;
+    if (!hasAudio || !hasVideo) {
+      start = true; // no audio to WITHHOLD (video-only), or no video to sync to (audio-only) → start now
+    } else if (!this.firstFrameSeen) {
+      start = false; // video present but no frame/clock yet (mpv video_status < STATUS_READY → wait)
+    } else {
+      const apts = this.audioHeardPtsAbsMs();
+      start = Number.isFinite(apts) && this._currentMs >= apts && this.pcmDepthSecs() >= AUDIO_PREFILL_SECS;
+    }
+    if (start) {
+      this.audioSyncPending = false;
+      this.publishOutputLatency(); // audio output begins ⇒ the ctx is running ⇒ outputLatency valid (host-ctx path too)
+      this.setRingPlaying(true);
+    }
+  }
+
+  /** Flip the ring's RW_PLAYING flag (1 = the worklet outputs + advances the clock; 0 = silence + hold the
+   *  cursor + release C_AUDIO). MAIN owns this slot; set 0 BEFORE the present worker should stop seeing the
+   *  audio clock advance. (Mirrors the reference player's set_ring_playing.) */
+  private setRingPlaying(on: boolean): void {
+    if (this.audioRingCtrl) Atomics.store(this.audioRingCtrl, RW_PLAYING, on ? 1 : 0);
+  }
+
+  /** Frames buffered in the PCM ring (producer write − consumer read), the in-flight audio reservoir depth
+   *  for getStats(). Never negative. 0 with no ring. */
+  private audioRingReadableFrames(): number {
+    const c = this.audioRingCtrl;
+    if (!c) return 0;
+    return Math.max(0, Atomics.load(c, RW_WRITE) - Atomics.load(c, RW_READ));
+  }
+
+  /** A/V lip-sync error (ms): the single-domain av_diff the PRESENT worker computed (master clock − displayed
+   *  PTS) at one draw instant and shipped on the `time` message — NOT a cross-realm subtraction of a fresh
+   *  audio read from a stale _currentMs. ~0 when lip-synced; the readout that confirms pacing. 0 to the host
+   *  until the first time post. (mpv update_av_diff.) */
+  private avDiffMs(): number {
+    // Only meaningful while audio is the master clock — a video-only / audio-degraded stream has no lip-sync
+    // reference, so report 0 rather than a stale present-side number (matches the reference player's av_diff_ms).
+    return this.audioActive && Number.isFinite(this.presentAvDiffMs) ? Math.round(this.presentAvDiffMs) : 0;
+  }
+
+  /** Re-anchor MAIN's audio bookkeeping + signal the decode worker. `seek=true` (VOD seek) posts
+   *  audioSeekFlush (flush + seek-block, NO early rebase) so a still-buffered pre-seek packet can't anchor
+   *  C_ACLOCK to the old position; `seek=false` (live restart / load / unload) posts audioResetEpoch.
+   *
+   *  The PCM ring re-anchor (bump RW_GEN + re-map the media-PTS clock edge) is now done BY THE DECODE
+   *  WORKER (it owns RW_GEN/RW_BASE_MS/RW_EDGE_* — the producer slots; single-writer discipline). MAIN only
+   *  signals the intent. The clock SAB (C_ACLOCK/C_AUDIO) is NOT touched here either — the worklet is its
+   *  SOLE writer (no two-writer race). MAIN keeps RW_GEN in lockstep ONLY for the worklet's processorOptions
+   *  .gen it seeds on a FRESH ring (ensureAudio); a re-anchor reuses the ring, so the worker's bump is what
+   *  the worklet observes. (Mirrors the reference player's reset_audio_epoch.) */
+  private resetAudioEpoch(seek: boolean): void {
+    // A live restart / seek starts fresh — clear any cache-pause freeze (the worker also resets its flag).
+    if (this.buffering) {
+      this.buffering = false;
+      this.postPresent({ type: 'setPaused', paused: false });
+    }
     this.audioActive = false;
-    this.audioNextStart = 0;
-    this.segQ = [];
-    this.mediaBase = 0;
-    this.liveSyncStalls = 0;
-    this.liveSyncSmoothChunks = 0;
-    this.liveSyncHoldChunks = 0;
-    this.liveSyncLastRate = 1;
+    this.presentAvDiffMs = Number.NaN; // fresh timeline: don't carry the prior stream's lip-sync value into getStats
     this.liveLatencySecs = 0;
     this._workerStats = null;
-    // Re-seed the stall instrument: a new audio epoch (re-attach/seek/resume) must NOT count the
-    // teardown/seek pause as an inter-tick gap. Zeroing cpLastAt makes the next publishClock tick re-seed
-    // the report window instead of measuring a bogus multi-second gap. audioDrops is NOT reset here — like
-    // audioUnderruns it is a cumulative cross-epoch health counter.
-    this.cpLastAt = 0;
-    this.cpMaxGap = 0;
-    if (this.clock) { Atomics.store(this.clock, C_AUDIO, 0); Atomics.store(this.clock, C_ACLOCK, 0); }
+    if (seek) this.postAudio({ type: 'audioSeekFlush' }); // the PCM-ring producer is the audio worker
+    else this.postAudio({ type: 'audioResetEpoch' });
   }
 
   // ---- worker messages (DECODE worker) ---------------------------------------
@@ -942,18 +1396,14 @@ export class FerritePlayer {
   private onWorkerMessage(msg: WorkerToMain): void {
     switch (msg.type) {
       case 'ready':
-        this._workerInfo = msg.info;
+        // The VIDEO worker resolved its tier/codec/dims. MAIN merges the audio codec separately (it relays the
+        // audio codecParams from the demux to the audio worker), so msg.info.audioCodec is 0 here — preserve
+        // the existing audioCodec if MAIN already knows it (from a prior audio relay), else keep 0.
+        this._workerInfo = { ...msg.info, audioCodec: msg.info.audioCodec || (this._workerInfo?.audioCodec ?? 0) };
         this._tier = msg.info.tier; // tier known before the first per-second stats sample
         this.controller.dispatch({ type: 'opened' }); // opening → buffering (fidelity; no teardown effect)
         this.emit(Events.MEDIA_INFO, this.mediaInfo);
-        break;
-      case 'caps':
-        // The worker resolved the descriptor from the first response's headers.
-        // REFINE main's intent-only copy so the seek()/duration/seekbar forks key on the observed
-        // capabilities (e.g. a degraded-200 VOD flips seekable→false → seekbar hides). Re-emit MEDIA_INFO
-        // so a controls layer re-renders the scrub-vs-live decision against the refined duration.
-        this._caps = msg.caps;
-        if (this.mediaInfo) this.emit(Events.MEDIA_INFO, this.mediaInfo);
+        this.maybeStartAudioAo(); // codecs now known → an audio-only stream can release the audio_start_ao gate
         break;
       case 'log':
         this.emit(Events.LOG, msg.message);
@@ -961,36 +1411,9 @@ export class FerritePlayer {
       case 'deintFailed':
         this.emit(Events.DEINT_FAILED, msg.failed);
         break;
-      case 'audio':
-        this.playAudio(msg.pcm, msg.channels, msg.sampleRate, msg.ptsUs);
-        break;
-      case 'duration':
-        // VOD container duration (ms). Drives the `duration` getter + the scrub bar; emit MEDIA_INFO so
-        // a controls layer re-renders. The worker posts `ready` (→ _workerInfo) BEFORE this.
-        this._durationMs = msg.durationMs;
-        if (this.mediaInfo) this.emit(Events.MEDIA_INFO, this.mediaInfo);
-        break;
       case 'stats':
         this.updateStats(msg.stats);
         this.emit(Events.STATISTICS_INFO, this._stats);
-        break;
-      case 'ended':
-        this._paused = true;
-        this.emit(Events.LOADING_COMPLETE);
-        break;
-      case 'reconnecting':
-        // a recoverable live drop is re-opening with backoff → drive the controller into
-        // Reconnecting (Playing/Buffering → Reconnecting). Re-arm the first-frame latch so the post-
-        // recovery pre-roll re-fires `lowWater` (Reconnecting → Buffering → Playing). Stays internal
-        // (a LOG breadcrumb) — Events.ERROR is reserved for the FATAL exhausted case (errors.ts).
-        this.controller.dispatch({ type: 'reconnect' });
-        this.firstFrameSeen = false;
-        this.emit(Events.LOG, `reconnecting (attempt ${msg.attempt})`);
-        break;
-      case 'recovered':
-        if (this._lastError && !this._lastError.info.fatal) this._lastError = null;
-        this.controller.dispatch({ type: 'recovered' }); // Reconnecting → Buffering (next frame → Playing)
-        this.emit(Events.RECOVERED_EARLY_EOF);
         break;
       case 'error': {
         if (msg.fatal) this._paused = true;
@@ -1006,6 +1429,108 @@ export class FerritePlayer {
     }
   }
 
+  // ---- worker messages (DEMUX worker) -------------------------------
+
+  /** Post to the DEMUX worker. `init` (demuxInit) goes immediately; everything else is HELD in the demux
+   *  outbox until the worker posts `demuxWorkerReady`, then flushed IN ORDER — so demuxLoad never races ahead
+   *  of demuxInit (the engine-load + ring-attach order the worker needs). Mirrors postAudio / the audio outbox. */
+  private postDemux(msg: MainToDemux, init = false): void {
+    if (!this.demux) return;
+    if (init || this.demuxReady) this.demux.postMessage(msg);
+    else this.demuxOutbox.push(msg); // held until demuxWorkerReady
+  }
+
+  /** Flush the deferred demux outbox once the worker is ready (preserves post order after demuxInit). */
+  private flushDemuxOutbox(): void {
+    this.demuxReady = true;
+    const pending = this.demuxOutbox;
+    this.demuxOutbox = [];
+    for (const m of pending) this.demux?.postMessage(m);
+  }
+
+  /** DemuxToMain dispatch. The DEMUX worker owns the source + demux, so caps/duration/ended/
+   *  reconnecting/recovered + the codec-param relay + the ready handshake come from it now (no longer the
+   *  decode worker). MAIN RELAYS codecParams to the VIDEO worker (stream 0) and the AUDIO worker (stream 1),
+   *  and keyframeResync to the VIDEO worker. */
+  private onDemuxMessage(msg: DemuxToMain): void {
+    switch (msg.type) {
+      case 'demuxWorkerReady':
+        // The worker's onmessage is live → flush the held demuxInit-follow-ups (demuxLoad, etc.) in order.
+        this.flushDemuxOutbox();
+        break;
+      case 'caps':
+        // The demux resolved the descriptor from the first response's headers. REFINE main's intent-only copy
+        // so the seek()/duration/seekbar forks key on the observed capabilities. Re-emit MEDIA_INFO so a
+        // controls layer re-renders the scrub-vs-live decision against the refined duration.
+        this._caps = msg.caps;
+        if (this.mediaInfo) this.emit(Events.MEDIA_INFO, this.mediaInfo);
+        break;
+      case 'duration':
+        // VOD container duration (ms). Drives the `duration` getter + the scrub bar; emit MEDIA_INFO so a
+        // controls layer re-renders.
+        this._durationMs = msg.durationMs;
+        if (this.mediaInfo) this.emit(Events.MEDIA_INFO, this.mediaInfo);
+        break;
+      case 'codecParams':
+        // RELAY the resolved codec id + extradata to the right decode worker (the demux has no decoders). The
+        // extradata is TRANSFERRED forward (copied bytes; the receiving worker takes ownership). Video → the
+        // VIDEO worker (it builds the SW decoder + the Fix-A WC config record from these); audio → the AUDIO
+        // worker. Re-issue with a FRESH copy per hop (the inbound buffer is consumed by the first transfer).
+        if (msg.stream === DEMUX_STREAM_VIDEO) {
+          this.post({ type: 'codecParams', stream: msg.stream, codecId: msg.codecId, profile: msg.profile, level: msg.level, sarNum: msg.sarNum, sarDen: msg.sarDen, extradata: msg.extradata }, msg.extradata.byteLength > 0 ? [msg.extradata.buffer] : []);
+          // Mirror the resolved video codec into mediaInfo even before the VIDEO worker's `ready` lands.
+          if (this._workerInfo && msg.codecId > 0 && this._workerInfo.videoCodec !== msg.codecId) {
+            this._workerInfo = { ...this._workerInfo, videoCodec: msg.codecId };
+            this.emit(Events.MEDIA_INFO, this.mediaInfo);
+          }
+        } else if (msg.stream === DEMUX_STREAM_AUDIO) {
+          this.postAudio({ type: 'audioCodecParams', codecId: msg.codecId, extradata: msg.extradata }); // held in the audio outbox until audioWorkerReady; transferred there
+          // Merge the audio codec into mediaInfo (the demux is the only audio-codec source post-split).
+          if (this._workerInfo && msg.codecId > 0 && this._workerInfo.audioCodec !== msg.codecId) {
+            this._workerInfo = { ...this._workerInfo, audioCodec: msg.codecId };
+            this.emit(Events.MEDIA_INFO, this.mediaInfo);
+          }
+        }
+        break;
+      case 'keyframeResync':
+        // The demux armed a next-IDR resync (reconnect / resume / seek) → relay to the VIDEO worker (it arms
+        // its own await_keyframe). The AUDIO worker re-anchors via the ring epoch (no relay needed).
+        this.post({ type: 'keyframeResync' });
+        break;
+      case 'log':
+        this.emit(Events.LOG, msg.message);
+        break;
+      case 'ended':
+        // Route end-of-stream through the controller (→ Eof state; the host is told exactly once even if a
+        // decode-side ended ever joins). The emit('ended') command runs the imperative effect (pause +
+        // LOADING_COMPLETE) so paused() agrees with the controller.
+        this.controller.dispatch({ type: 'eof' });
+        break;
+      case 'reconnecting':
+        // A recoverable live drop is re-opening with backoff → drive the controller into Reconnecting. Re-arm
+        // the first-frame latch so the post-recovery pre-roll re-fires `lowWater`. Stays internal (a LOG
+        // breadcrumb) — Events.ERROR is reserved for the FATAL exhausted case.
+        this.controller.dispatch({ type: 'reconnect' });
+        this.firstFrameSeen = false;
+        this.emit(Events.LOG, `reconnecting (attempt ${msg.attempt})`);
+        break;
+      case 'recovered':
+        if (this._lastError && !this._lastError.info.fatal) this._lastError = null;
+        this.controller.dispatch({ type: 'recovered' }); // Reconnecting → Buffering (next frame → Playing)
+        this.emit(Events.RECOVERED_EARLY_EOF);
+        break;
+      case 'error': {
+        if (msg.fatal) this._paused = true;
+        if (msg.kind === 'engine-load') this.engineDead = true; // terminal for this instance
+        const err = mapFerriteError(msg.kind, msg.code, msg.msg, msg.fatal);
+        if (msg.fatal) this.handleFatal(err);
+        else this.emitError(err);
+        break;
+      }
+      // 'destroyed' is consumed by shutdownDemux's repointed handler.
+    }
+  }
+
   // ---- worker messages (PRESENT worker) --------------------------------------
 
   private onPresentMessage(msg: PresentToMain): void {
@@ -1018,6 +1543,8 @@ export class FerritePlayer {
         // First drawn frame ⇒ the pre-roll reached the watermark: buffering → playing (one-shot fidelity).
         if (!this.firstFrameSeen) { this.firstFrameSeen = true; this.controller.dispatch({ type: 'lowWater' }); }
         this._currentMs = msg.ms;
+        this.presentAvDiffMs = msg.avDiffMs;  // single-domain lip-sync, computed in the present worker at the draw instant
+        this.maybeStartAudioAo();             // the video clock advanced → re-check the mpv audio_start_ao release
         this.emit(Events.TIME_UPDATE, msg.ms / 1000);
         break;
       case 'vdims':
@@ -1055,6 +1582,7 @@ export class FerritePlayer {
         this.cadenceDrawRate = msg.cadenceDrawRate;
         this.cadenceDegradeReason = msg.cadenceDegradeReason;
         this.cadenceRung = msg.cadenceRung;
+        this.cadenceDropToKey = msg.cadenceDropToKey;
         break;
       case 'error':
         // FIX 1: a present-worker error (incl. present-init / WebGL2-unavailable failure) is fatal — route
@@ -1078,157 +1606,251 @@ export class FerritePlayer {
     };
   }
 
-  // ---- audio playout + master-clock publish ----------------------------------
+  // ---- audio playout (PCM ring + AudioWorklet) -------------------------------
 
+  /** Set up the audio pipeline: pick the host-injected ctx (attachAudio) or OWN a per-stream one, build the
+   *  makeup GainNode, allocate + SEED the PCM ring SAB (sized for AUDIO_RING_SECONDS at the ctx output rate),
+   *  hand the producer side to the decode worker (audioSetPcmRing) + forward the output rate (setAudioOutRate),
+   *  register interruption recovery (OWN ctx only), and spawn the persistent AudioWorklet that consumes the
+   *  ring + drives the master clock. Idempotent (returns if a ctx already exists). (Mirrors the reference player's
+   *  ensure_audio.) */
   private ensureAudio(): void {
     if (this.audioCtx) return;
-    this.audioCtx = new AudioContext();
-    this.audioGain = this.audioCtx.createGain();
-    this.audioGain.connect(this.audioCtx.destination);
-    this.applyGain(); // volume × mute × AGC makeup (makeup starts at unity)
-    // Forward the AudioContext rate to the engine so swresample resamples to it in ONE stateful pass
-    // (the engine then also downmixes surround → stereo), replacing Web Audio's per-AudioBuffer resample
-    // + auto-downmix. Soft no-op against an engine wasm that predates the setter (PCM then arrives at the
-    // decoded rate/layout and Web Audio handles it — the pre-overhaul path).
-    this.post({ type: 'setAudioOutRate', rate: Math.round(this.audioCtx.sampleRate) });
-  }
-
-  /** Publish the audio playout elapsed into the clock SAB (the present worker's `media_now` source).
-   *  Closed-loop from the in-flight segment FIFO (each segment at its own rate); MONOTONIC across an
-   *  underrun. Frozen while the context is suspended (paused) → the present clock holds. */
-  private publishClock(): void {
-    const clk = this.clock;
-    if (!clk) return;
-    // ---- DIAGNOSTIC: measure the inter-tick gap (proves a main-thread stall; observe-only) ----
-    // Cheap: one perf.now() + a compare + a ~1/s emit. A gap ≫ CLOCK_PUBLISH_MS means main was blocked
-    // and the timer queued behind a long task → the SAB clock could not be refreshed → present froze.
-    // segQ/ahead growing alongside the gap ⇒ the reservoir blocker; a gap WITHOUT growth ⇒ GC.
-    if (DEBUG) {
-      const perfNow = performance.now();
-      if (this.cpLastAt > 0) {
-        const gap = perfNow - this.cpLastAt;
-        if (gap > this.cpMaxGap) this.cpMaxGap = gap;
-      } else {
-        this.cpReportAt = perfNow; // first tick: seed the report window (no gap yet)
-      }
-      this.cpLastAt = perfNow;
-      if (perfNow - this.cpReportAt >= 1000) {
-        this.emit(Events.LOG, `[clock] maxGap=${this.cpMaxGap | 0}ms segQ=${this.segQ.length} ahead=${this.liveLatencySecs.toFixed(2)}s drops=${this.audioDrops}`);
-        this.cpMaxGap = 0;
-        this.cpReportAt = perfNow;
-      }
-    }
-    const ctx = this.audioCtx;
-    if (!ctx || !this.audioActive) { Atomics.store(clk, C_AUDIO, 0); return; }
-    if (ctx.state === 'suspended') return; // frozen current_time → leave the last published value
-    const now = ctx.currentTime;
-    // Pop every segment fully in the past, accruing its media into mediaBase (each at its own rate).
-    const q = this.segQ;
-    while (q.length && now >= q[0].ws + q[0].media / q[0].rate) { this.mediaBase += q[0].media; q.shift(); }
-    const elapsed = q.length
-      ? this.mediaBase + Math.max(0, now - q[0].ws) * q[0].rate
-      // Nothing scheduled ahead (underrun/EOF tail): COAST on the wall clock from where audio left off
-      // so the present clock keeps moving instead of dead-stalling.
-      : this.mediaBase + Math.max(0, now - this.audioNextStart);
-    const lat = (ctx as unknown as { outputLatency?: number }).outputLatency ?? 0;
-    const elapsedSecs = Math.max(0, elapsed - lat);
-    Atomics.store(clk, C_ACLOCK, Math.round(elapsedSecs * 1000)); // MILLISECONDS (wrap-safe i32)
-    Atomics.store(clk, C_AUDIO, 1);
-  }
-
-  // ptsUs is unused: audio scheduling is wall-clock-driven (audioNextStart), not PTS-driven.
-  private playAudio(interleaved: Float32Array, channels: number, sampleRate: number, _ptsUs: number): void {
-    if (!this.audioCtx || !this.audioGain || this._paused) return;
-    // ---- bound the audio reservoir (drop, don't queue) ----
-    // The decode-vs-realtime surplus schedules chunks ever-further into the future → the reservoir
-    // (scheduledAhead) climbs to ~2.5s, deepening the live AudioBufferSourceNode queue + GC churn that
-    // stalls main and starves the clock publisher (the freeze). If the cursor is already past the
-    // liveSyncMaxLatency cap, DROP this chunk: a sub-frame live audio gap is far cheaper than a 2s
-    // present freeze (mpv/VLC bound the device buffer / hard-resync past a threshold; this is the
-    // symmetric UPPER bound to policy.ts's lower-target relax). Critically the drop does NOT touch
-    // segQ/mediaBase/audioNextStart — the published A_ACLOCK stays MONOTONIC (no backward jump/judder).
-    const scheduledAhead = this.audioActive ? Math.max(0, this.audioNextStart - this.audioCtx.currentTime) : 0;
-    if (this.audioActive && scheduledAhead > this.cfg.liveSyncMaxLatency) {
-      this.audioDrops++;
-      this.liveLatencySecs = scheduledAhead; // telemetry only (no clock state) — keeps the latency-to-live signal honest during the drain burst (the reservoir pinned at the cap)
-      return; // before any buffer/source allocation and without advancing the schedule cursor
-    }
-    const frames = interleaved.length / channels;
-    if (frames <= 0) return;
-    // Loudness AGC: integrate this chunk's RMS/peak + glide the makeup gain toward the target level.
-    this.measureLoudness(interleaved, channels, sampleRate);
-    this.applyGain(true);
-    const buf = this.audioCtx.createBuffer(channels, frames, sampleRate);
-    for (let c = 0; c < channels; c++) {
-      const ch = buf.getChannelData(c);
-      for (let i = 0; i < frames; i++) ch[i] = interleaved[i * channels + c];
-    }
-    const src = this.audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(this.audioGain);
-    // No per-node `src.onended = () => src.disconnect()`. A finished AudioBufferSourceNode
-    // releases its playing-reference and is GC-eligible even while still connected (WebAudio spec), so the
-    // closure + disconnect were needless per-chunk churn (a retained closure + a graph mutation per chunk)
-    // feeding exactly the GC pressure that stalls main. Let the finished node fall out of scope.
-    const ctx = this.audioCtx;
-
-    // ---- live latency-sync: this chunk's master-clock playback rate ----
-    if (this.liveSyncHoldChunks > 0) this.liveSyncHoldChunks--;
-    let rate = 1;
-    if (this.cfg.liveSync && this._caps.hasLiveEdge) {
-      const scheduledAhead = Math.max(0, this.audioNextStart - ctx.currentTime);
-      this.liveLatencySecs = scheduledAhead; // latency-to-live proxy (the reservoir signal)
-      const target = liveSyncTarget(this.liveSyncStalls, this.cfg.liveSyncTargetLatency, this.cfg.liveSyncMaxLatency);
-      const forceUnity = !this.audioActive || this.liveSyncHoldChunks > 0;
-      rate = liveSyncRate(
-        scheduledAhead, target, scheduledAhead, forceUnity,
-        this.cfg.liveSyncPlaybackRate, this.cfg.liveSyncDeadbandSecs,
-        this.cfg.liveSyncGateSecs, this.cfg.liveSyncSigmoidSteepness,
-      );
-      this.liveSyncSmoothChunks++;
-      if (this.liveSyncSmoothChunks >= LIVE_SYNC_STALL_DECAY_CHUNKS && this.liveSyncStalls > 0) {
-        this.liveSyncStalls--; this.liveSyncSmoothChunks = 0;
-      }
-      if (DEBUG && Math.abs(rate - this.liveSyncLastRate) > 1e-4) {
-        this.liveSyncLastRate = rate;
-        console.debug(`FERRITE live-sync: rate=${rate.toFixed(3)} buf=${scheduledAhead.toFixed(3)}s target=${target.toFixed(3)}s stalls=${this.liveSyncStalls}`);
-      }
-    }
-
-    let start: number;
-    if (!this.audioActive) {
-      // First chunk after a (re)anchor: lead by 0.15 s so the master clock + the first frames have a
-      // cushion before audio is audible. Until ctx reaches it, the published elapsed is 0 → the present
-      // worker holds on its video anchor. This SEEDS the fresh audio epoch (segQ/mediaBase were zeroed
-      // by resetAudioEpoch).
-      start = ctx.currentTime + 0.15;
-      this.audioActive = true;
+    // HOST-OWNED path: attach to the injected app-lifetime ctx (the host created + unlocks + recovers it; we
+    // never create/resume/close it). Otherwise OWN a per-stream ctx (the standalone fallback). Node
+    // construction below is legal on a SUSPENDED context — only resume() needs the gesture, which the host
+    // (or, on the own path, play()) does.
+    const hostOwned = !!this.hostAudioCtx;
+    let ctx: AudioContext;
+    if (this.hostAudioCtx) {
+      ctx = this.hostAudioCtx;
     } else {
-      start = this.audioNextStart;
-      if (start < ctx.currentTime) {
-        // Audio-health instrument: count the underrun + the silence it inserts (the cursor fell `behind`
-        // s and we additionally lead by 0.05 s). The clock is audio-locked, so this IS a present stutter.
-        this.audioUnderruns++;
-        this.audioGapSecs += (ctx.currentTime - start) + 0.05;
-        // Underrun: scheduled audio fell behind. Reschedule with a small gap and re-anchor the SCHEDULE
-        // cursor (next_start) — but DON'T touch segQ/mediaBase: the published A_ACLOCK stays MONOTONIC,
-        // so the present worker never sees a backward clock jump (the reference player's model — its
-        // present worker owns the video anchor and re-anchors only on PTS-seam detection, never on an
-        // audio underrun). Count the stall (relax the target) + pin rate 1.0 for a hold window.
-        start = ctx.currentTime + 0.05;
-        const maxStalls = Math.max(0,
-          Math.ceil((this.cfg.liveSyncMaxLatency - this.cfg.liveSyncTargetLatency) / LIVE_SYNC_STALL_RELAX_SECS));
-        this.liveSyncStalls = Math.min(this.liveSyncStalls + 1, maxStalls);
-        this.liveSyncSmoothChunks = 0;
-        this.liveSyncHoldChunks = LIVE_SYNC_RESUME_HOLD_CHUNKS;
-      }
+      // latencyHint:'interactive' — shortest read-ahead on the audio thread → tighter live-edge + faster
+      // recovery after a re-anchor. Fall back to a default ctx if the option is rejected.
+      try { ctx = new AudioContext({ latencyHint: 'interactive' }); }
+      catch { try { ctx = new AudioContext(); } catch { return; } }
     }
-    if (rate !== 1) src.playbackRate.value = rate;
-    src.start(start);
-    // The buffer is buf.duration MEDIA seconds but plays in …/rate WALL seconds (faster), so advance
-    // the wall cursor by the shorter playout duration + record the segment for the closed-loop clock.
-    this.audioNextStart = start + buf.duration / rate;
-    this.segQ.push({ ws: start, media: buf.duration, rate });
+    this.audioCtxIsHost = hostOwned;
+    this.audioCtx = ctx;
+    this.audioGain = ctx.createGain();
+    this.audioGain.connect(ctx.destination);
+    this.applyGain(); // volume × mute × makeup (makeup starts at unity until the worker reports loudness)
+
+    const outRate = ctx.sampleRate;
+    // Build the PCM ring SAB the decode worker (producer) + the worklet (consumer) share, sized for
+    // AUDIO_RING_SECONDS at the OUTPUT rate (the worker engine-resamples to it). The data region is
+    // interleaved stereo (RING_CHANNELS). Built synchronously so the worker can fill it during the (~1
+    // quantum) async addModule window; the worklet drains it once it starts. MAIN holds the control view
+    // (telemetry + RW_PLAYING) but NEVER writes the data region nor the producer cursors.
+    const cap = ringFramesFor(AUDIO_RING_SECONDS, outRate);
+    const sab = new SharedArrayBuffer(ringSabBytes(cap));
+    const ctrl = new Int32Array(sab, 0, RING_CTRL_SLOTS);
+    const data = new Float32Array(sab, RING_CTRL_SLOTS * 4);
+    this.audioRingGen = (this.audioRingGen + 1) | 0;
+    Atomics.store(ctrl, RW_WRITE, 0);
+    Atomics.store(ctrl, RW_READ, 0);
+    Atomics.store(ctrl, RW_UNDERRUNS, 0);
+    Atomics.store(ctrl, RW_OVERWRITES, 0);
+    Atomics.store(ctrl, RW_BASE_MS, 0);
+    Atomics.store(ctrl, RW_PLAYING, this.internalPaused() ? 0 : 1); // composite: paused OR buffering OR audio_start_ao-pending all withhold
+    Atomics.store(ctrl, RW_RATE, Math.round(outRate));
+    Atomics.store(ctrl, RW_GEN, this.audioRingGen);
+    Atomics.store(ctrl, RW_EDGE_FRAME, 0); // media-PTS clock map (the decode worker publishes it per chunk)
+    Atomics.store(ctrl, RW_EDGE_PTS_MS, 0);
+    this.audioRingCap = cap;
+    this.audioRingCtrl = ctrl;
+    this.audioRingData = data;
+    this.audioRingSab = sab;
+    // Hand the producer side to the AUDIO worker — it writes the ring directly (replacing the retired
+    // playAudio MAIN-hop) + owns RW_WRITE/RW_BASE_MS/RW_EDGE_* (the producer slots). Held in the audio outbox
+    // until audioWorkerReady so it lands after audioInit (the engine-load order the worker needs).
+    this.postAudio({ type: 'audioSetPcmRing', pcmRing: sab, pcmRingCap: cap, sampleRate: outRate });
+    // Forward the ctx output rate so the engine resamples to it in ONE stateful swresample pass (the engine
+    // also downmixes surround → stereo), replacing Web Audio's per-chunk resample. (audioSetPcmRing already
+    // carries the rate; this keeps it fresh on a rate change.)
+    this.postAudio({ type: 'audioSetOutRate', rate: Math.round(outRate) });
+
+    // Interruption recovery: the master clock IS the AudioContext, so a frozen ctx freezes the whole
+    // pipeline. Watch statechange + re-resume on a backoff — ONLY for an OWN (per-stream) ctx. A HOST ctx is
+    // recovered by the host over the ctx's full lifetime (our per-stream player is torn down each load, so a
+    // per-player handler would leave the long-lived ctx uncovered in the gap). Don't touch the host ctx's
+    // onstatechange.
+    if (!hostOwned) {
+      const handler = (): void => this.onAudioStatechange();
+      this.audioStatechangeHandler = handler;
+      ctx.onstatechange = handler;
+    } else if (!this.hostAudioStatechangeHandler) {
+      // HOST ctx: the host owns ctx.onstatechange (its recovery ladder — host-audio.ts), so we must NOT
+      // clobber it. Add a SEPARATE 'statechange' listener (coexists with the property handler) to catch the
+      // COLD suspended→running edge: run 1's Play is the first gesture that unlocks the app-lifetime ctx WITH
+      // latency; during that window the worklet's process() doesn't run, so the PCM ring backlogs seconds of
+      // audio while video free-runs. On the running edge we drop the backlog via the SAME live re-arm the
+      // own-ctx path uses, so C_ACLOCK joins at the live head instead of draining seconds behind (the rush).
+      const handler = (): void => this.onHostAudioStatechange();
+      this.hostAudioStatechangeHandler = handler;
+      ctx.addEventListener('statechange', handler);
+    }
+
+    // Spawn the worklet asynchronously (addModule is a Promise); the ring is already live, so producer
+    // writes during this window are simply drained once the node starts. Bump the ring INSTANCE — the
+    // spawnWorklet validity guard keys on it (a fresh ensureAudio during an in-flight await drops the node).
+    this.audioRingInstance = (this.audioRingInstance + 1) | 0;
+    if (this.clockSab) {
+      void this.spawnWorklet(ctx, sab, this.clockSab, cap, this.audioRingGen, this.audioRingInstance);
+    }
+    if (DEBUG) {
+      // breadcrumb: the resolved audio ring (the off-main scheduler's bound). audioRingSab/audioRingData are
+      // held for parity (the worklet+worker own the data region); audioRingCap is the frame bound.
+      const bytes = this.audioRingSab?.byteLength ?? 0;
+      this.emit(Events.LOG, `[audio] ring cap=${this.audioRingCap}fr (${bytes}B, data=${this.audioRingData?.length ?? 0}f32) rate=${Math.round(outRate)} host=${hostOwned}`);
+    }
+  }
+
+  /** Async: `await audioWorklet.addModule(blob)` → build the AudioWorkletNode → connect node → gain. The ring
+   *  SAB + clock SAB + cap + gen reach the processor via processorOptions. Guarded against teardown / a fresh
+   *  ensureAudio during the await via the captured `instance` (a superseded epoch drops the node). (Mirrors
+   *  the reference player's spawn_worklet.) */
+  private async spawnWorklet(
+    ctx: AudioContext, ring: SharedArrayBuffer, clock: SharedArrayBuffer,
+    cap: number, gen: number, instance: number,
+  ): Promise<void> {
+    const url = workletUrl();
+    // addModule is NOT idempotent: a 2nd addModule of the SAME processor name on the SAME ctx rejects
+    // (already-registered). A HOST ctx is REUSED across streams + a prior (torn-down) player's in-flight
+    // addModule isn't cancelled, so two tasks can race on one ctx. Latch the addModule PROMISE on the ctx
+    // (set BEFORE the await): the first task issues addModule + stores its promise; any concurrent/later task
+    // awaits the SAME promise instead of issuing a second addModule. Then each stream just constructs a fresh
+    // node (the canonical MDN/Chrome pattern). An OWN per-stream ctx is fresh → no latch → registers once.
+    const LATCH = '__ferriteWorkletModule';
+    const aw = ctx.audioWorklet;
+    const existing: Promise<void> | undefined = (ctx as any)[LATCH];
+    let moduleOk: boolean;
+    if (existing) {
+      moduleOk = await existing.then(() => true, () => false);
+    } else {
+      try {
+        const p = aw.addModule(url);
+        (ctx as any)[LATCH] = p; // latch BEFORE the await
+        moduleOk = await p.then(() => true, () => false);
+        if (!moduleOk) (ctx as any)[LATCH] = undefined; // genuine load failure → clear so a retry can re-add
+      } catch { moduleOk = false; }
+    }
+    URL.revokeObjectURL(url); // module compiled (or failed) → the blob URL is done
+    if (!moduleOk) return;
+    const node = new AudioWorkletNode(ctx, PROCESSOR_NAME, {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+      processorOptions: { ring, clock, cap, gen },
+    });
+    // Validity guard: only a teardown (ctx gone) or a fresh ensureAudio (new ring INSTANCE) during the await
+    // invalidates this node. A live re-anchor bumps the gen but NOT the instance, so the node stays valid (its
+    // ring is the same SAB). A dead instance → discard (its ctx is closing).
+    if (this.destroyed || this.audioRingInstance !== instance || !this.audioCtx) {
+      node.disconnect();
+      return;
+    }
+    if (this.audioGain) node.connect(this.audioGain);
+    this.audioWorklet = node;
+  }
+
+  /** Raw AudioContext `state` string — read via property access because the non-standard iOS `interrupted`
+   *  state isn't in TS's AudioContextState union (a typed read would lose it). */
+  private static audioCtxStateStr(ctx: AudioContext): string {
+    return (ctx as unknown as { state: string }).state ?? '';
+  }
+
+  /** AudioContext statechange handler (OWN ctx only). `running` clears the recovery state; an `interrupted`
+   *  or an unexpected `suspended` while we intend to play kicks the backoff-paced resume. A deliberate
+   *  pause()/unload() sets `_paused`, so we never fight an intentional suspend. (Mirrors on_audio_statechange.) */
+  private onAudioStatechange(): void {
+    const ctx = this.audioCtx;
+    // Guard a stale handler that fires after teardown nulled the ctx (or after we cleared the handler ref):
+    // only an own ctx with a registered handler drives recovery.
+    if (!ctx || !this.audioStatechangeHandler) return;
+    const st = FerritePlayer.audioCtxStateStr(ctx);
+    if (st === 'running') {
+      this.audioRecoveryAttempts = 0; // recovered → the next interruption starts a fresh ladder
+      if (this.audioResumeTimer) { clearTimeout(this.audioResumeTimer); this.audioResumeTimer = 0; }
+      this.publishOutputLatency(); // outputLatency is valid once running (0 while suspended) → publish now
+      this.maybeStartAudioAo();    // a delayed running edge may now satisfy the audio_start_ao gate
+      // RESUME EDGE (live): the ctx reached `running` again. If the resume was DELAYED past
+      // AUDIO_REARM_MIN_DELAY_MS (iOS missed the activation window → a later gesture; or an interrupted/
+      // suspended recovery), a stale backlog accumulated while suspended — re-arm the audio epoch so the
+      // worker SNAPS the ring to the live head instead of draining from the frozen read cursor against a
+      // stale anchor. A PROMPT resume (normal desktop start) is skipped — play()'s own epoch + the worker's
+      // fresh-anchor coalesce already handle it (so we don't drop the startup buffer).
+      if (!this._paused && !this.destroyed && this._caps.hasLiveEdge
+          && performance.now() - this.audioPlayAtMs > AUDIO_REARM_MIN_DELAY_MS) {
+        this.resetAudioEpoch(false);
+      }
+    } else if (!this._paused && (st === 'interrupted' || st === 'suspended')) {
+      // Do NOT reset attempts here: an interruption that flaps (interrupted→suspended→interrupted without
+      // ever reaching `running`) is ONE ongoing failure. Resetting per-event would peg the backoff at the
+      // floor + never reach the give-up cap. Only `running` clears the ladder.
+      this.scheduleAudioResume();
+    }
+  }
+
+  /** HOST ctx statechange observer (added via addEventListener in ensureAudio, so it does NOT clobber the
+   *  host's ctx.onstatechange recovery — host-audio.ts). The player NEVER resumes/recovers a host ctx (the
+   *  host does), so this handles ONLY the COLD running edge: the first Play unlocks the app-lifetime ctx with
+   *  latency, and while it was suspended the worklet's process() didn't drain the PCM ring → a multi-second
+   *  stale backlog. On the running edge, re-arm the audio epoch (worker bumps RW_GEN → the worklet snaps
+   *  read=write, dropping the backlog) so C_ACLOCK joins at the live head instead of draining seconds behind
+   *  the free-run video (the clamped PLL then sees a small residual, not a multi-second slew = the rush).
+   *  Gated IDENTICALLY to the own-ctx running-edge re-arm above: live-edge only, not paused/destroyed, and a
+   *  DELAYED resume only (a prompt warm-ctx running edge — run 2 — is skipped, so the aligned startup buffer
+   *  is never dropped). */
+  private onHostAudioStatechange(): void {
+    const ctx = this.audioCtx;
+    if (!ctx || !this.audioCtxIsHost) return; // only while attached to a host ctx
+    if (FerritePlayer.audioCtxStateStr(ctx) !== 'running') return;
+    if (!this._paused && !this.destroyed && this._caps.hasLiveEdge
+        && performance.now() - this.audioPlayAtMs > AUDIO_REARM_MIN_DELAY_MS) {
+      this.resetAudioEpoch(false);
+    }
+  }
+
+  /** Arm a one-shot backoff timer to retry resume() (OWN ctx). No-op if one is pending (don't stack) or the
+   *  cap is hit. (Mirrors schedule_audio_resume.) */
+  private scheduleAudioResume(): void {
+    if (this.audioResumeTimer || this.audioRecoveryAttempts >= AUDIO_RECOVERY_MAX_ATTEMPTS) return;
+    const delay = Math.min(
+      AUDIO_RECOVERY_BACKOFF_MIN_MS << Math.min(this.audioRecoveryAttempts, 5),
+      AUDIO_RECOVERY_BACKOFF_MAX_MS,
+    );
+    this.audioResumeTimer = setTimeout(() => this.tryResumeAudio(), delay);
+  }
+
+  /** Backoff timer fired: attempt one resume(). On a still-frozen ctx, grow the backoff + re-arm (to the
+   *  cap). A successful resume fires statechange→running, which resets + cancels via onAudioStatechange.
+   *  resume()'s promise is fire-and-forget — iOS rejects it while still interrupted, the next tick retries.
+   *  (Mirrors try_resume_audio.) */
+  private tryResumeAudio(): void {
+    this.audioResumeTimer = 0; // this timer fired
+    const ctx = this.audioCtx;
+    if (!ctx) return;
+    if (this._paused) { this.audioRecoveryAttempts = 0; return; }
+    if (FerritePlayer.audioCtxStateStr(ctx) === 'running') { this.audioRecoveryAttempts = 0; return; }
+    ctx.resume().catch(() => {});
+    this.audioRecoveryAttempts++;
+    this.scheduleAudioResume();
+  }
+
+  /** mpv cache-pause: the decode worker reported the audio output starved (buffering=true) or refilled
+   *  (false). Freeze/resume the clock (RW_PLAYING) + the present so playback rebuffers from the frozen
+   *  position instead of free-running/skipping. NEVER override a user pause: the present freezes on
+   *  `buffering || paused` (a DISTINCT setBuffering flag, not setPaused), so a rebuffer refill can't un-freeze
+   *  a user pause and a user resume can't un-freeze an active rebuffer; and while paused RW_PLAYING is already
+   *  0 and stays 0 (the !_paused gate). (Mirrors the AudioToMain::Rebuffer branch + MainToPresent::SetBuffering.) */
+  private onAudioRebuffer(buffering: boolean): void {
+    if (this.buffering === buffering) return;
+    this.buffering = buffering;
+    this.postPresent({ type: 'setBuffering', buffering }); // freeze/resume the present clock — orthogonal to user pause
+    if (buffering) this.setRingPlaying(false);                  // freeze (always honoured)
+    else if (!this.internalPaused()) this.setRingPlaying(true); // resume only when nothing else withholds (not user-paused, not audio_start_ao-pending)
+    this.emit(Events.LOG, buffering ? 'rebuffering (audio output starved)…' : 'rebuffered — resuming');
   }
 
   private post(msg: MainToWorker, transfer: Transferable[] = []): void {
@@ -1236,6 +1858,71 @@ export class FerritePlayer {
   }
   private postPresent(msg: MainToPresent, transfer: Transferable[] = []): void {
     this.present?.postMessage(msg, transfer);
+  }
+  /** Post to the AUDIO worker. `init` (audioInit) goes immediately; everything else is HELD in the audio
+   *  outbox until the worker posts `audioWorkerReady`, then flushed IN ORDER — so audioSetPcmRing / a relayed
+   *  audioCodecParams / audioLoad never race ahead of audioInit (the engine-load order the worker needs).
+   *  `audioCodecParams.extradata` is TRANSFERRED (copied bytes). Mirrors the reference player's pending_audio_init + flush. */
+  private postAudio(msg: MainToAudio, init = false): void {
+    if (!this.audio) return;
+    if (init || this.audioReady) {
+      const transfer = msg.type === 'audioCodecParams' && msg.extradata.byteLength > 0 ? [msg.extradata.buffer] : [];
+      this.audio.postMessage(msg, transfer);
+    } else {
+      this.audioOutbox.push(msg); // held until audioWorkerReady
+    }
+  }
+
+  /** Flush the deferred audio outbox once the worker is ready (preserves post order after audioInit). */
+  private flushAudioOutbox(): void {
+    this.audioReady = true;
+    const pending = this.audioOutbox;
+    this.audioOutbox = [];
+    for (const m of pending) {
+      const transfer = m.type === 'audioCodecParams' && m.extradata.byteLength > 0 ? [m.extradata.buffer] : [];
+      this.audio?.postMessage(m, transfer);
+    }
+  }
+
+  // ---- worker messages (AUDIO worker) ----------------------------------------
+
+  /** AudioToMain dispatch. The audio telemetry (audioStats → makeup gain + getStats) + the mpv
+   *  cache-pause rebuffer signal + the ready handshake + the circuit-breaker degrade now come from the AUDIO
+   *  worker, where the PCM lives — no longer the decode worker. */
+  private onAudioMessage(msg: AudioToMain): void {
+    switch (msg.type) {
+      case 'audioWorkerReady':
+        // The worker's onmessage is live → flush the held audioSetPcmRing / audioCodecParams / audioLoad in order.
+        this.flushAudioOutbox();
+        break;
+      case 'audioStats':
+        // ~2 Hz audio telemetry (the RMS/peak FOLD runs where the PCM lives). Mirror it into getStats() +
+        // drive the DOM-bound makeup GainNode from the reported loudness/peak.
+        this.audioActive = msg.active;
+        this.audioLoudnessDb = msg.loudnessDb;
+        this.audioPeak = msg.peak;
+        this.audioDrops = msg.drops;
+        this.audioSrcChannels = msg.srcChannels;
+        this.audioStreamRate = msg.streamRate;
+        this.liveLatencySecs = msg.scheduledAhead; // latency-to-live proxy (the reservoir depth)
+        this.updateLoudnessGain(msg.loudnessDb !== 0); // measured gate → unity until the first real sample
+        break;
+      case 'audioRebuffer':
+        this.onAudioRebuffer(msg.buffering);
+        break;
+      case 'audioDegraded':
+        // Circuit-breaker: the audio worker freed its decoder (a codec the WASM decoder can't handle) →
+        // silent-audio, video continues. Release the master clock (the worklet stops advancing C_AUDIO) so
+        // the present clock falls back to video-paced, and surface it.
+        this.audioActive = false;
+        this.setRingPlaying(false);
+        this.emit(Events.LOG, 'audio degraded to silent (decoder unsupported) — video continues');
+        break;
+      case 'log':
+        this.emit(Events.LOG, msg.message);
+        break;
+      // 'destroyed' is consumed by shutdownAudio's repointed handler.
+    }
   }
 }
 
@@ -1259,3 +1946,7 @@ export default Ferrite;
 
 export { Events, ErrorTypes, ErrorDetails, LoaderErrors, mergeConfig };
 export type { FerriteConfig, FerriteStats, MediaDataSource, MediaInfo, StatisticsInfo, Tier, FerriteError };
+// OPTIONAL host-audio glue: a host creates ONE app-lifetime, gesture-unlocked, recovered AudioContext and
+// injects it into each player via player.attachAudio(). The standalone player works WITHOUT this (own-ctx
+// path). See src/host-audio.ts.
+export { initHostAudio, hostAudioCtx } from './host-audio';

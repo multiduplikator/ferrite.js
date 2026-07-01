@@ -78,6 +78,8 @@ export interface StatsCounters {
   cadenceDegradeReason: number;
   /** Graduated auto-degrade rung: 0 none · 1 skip-non-ref · 2 +skip-loop · 3 +present-cap (the active levers read off it). */
   cadenceRung: number;
+  /** Fix-B rung-4 fires this load (Live drop-to-keyframe top rung); 0 on a healthy stream (proves the relief fired). */
+  cadenceDropToKey: number;
   /** Audio health: in-flight scheduled audio segments (the audio FIFO depth; FerriteStats.audioQueue). */
   audioFifoDepth: number;
   /** Audio health: cumulative audio playout underruns (the clock is audio-locked → these stutter present). */
@@ -90,7 +92,7 @@ export interface StatsCounters {
   playbackRate: number;
   /** Latency-to-live (s) — STUBBED 0 (no live ingest yet). */
   latencyToLive: number;
-  /** Audio underruns counted (cumulative; FerriteStats.liveSyncStalls). */
+  /** Ingest stall-watchdog firings counted (cumulative; FerriteStats.stalls). */
   stalls: number;
   /** Live reconnects (cumulative) — STUBBED 0 (no live ingest / reconnect path yet). */
   reconnects: number;
@@ -136,7 +138,7 @@ function zeroCounters(): StatsCounters {
     presentIntervalMs: 0, presentIntervalP95Ms: 0, presentIntervalMaxMs: 0, presentStutters: 0, presentSeamGaps: 0,
     clockAdvanceFps: 0, clockRateRatio: 0, clockResidualMs: 0, rafFps: 0, presentDropsPerSec: 0,
     vsyncIntervalMs: 0, displayHz: 0, cadenceHoldMean: 0, cadenceHold2Frac: 0, cadenceErrorMs: 0, syncResyncsPerSec: 0,
-    cadenceTier: 0, cadenceDrawRate: 0, cadenceDegradeReason: 0, cadenceRung: 0,
+    cadenceTier: 0, cadenceDrawRate: 0, cadenceDegradeReason: 0, cadenceRung: 0, cadenceDropToKey: 0,
     audioFifoDepth: 0, audioUnderruns: 0, audioGapSecs: 0,
     audioDrift: 0, playbackRate: 0, latencyToLive: 0,
     stalls: 0, reconnects: 0, openVideoFrames: 0, workers: 0, audioContexts: 0, connections: 0,

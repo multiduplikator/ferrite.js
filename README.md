@@ -157,6 +157,7 @@ Notes:
 | `wasmBaseUrl` | `'/'` | base URL serving `ferrite.mjs` + `ferrite.wasm` |
 | `threads` | `8` | software decoder pthread pool size |
 | `preferWebCodecs` | `true` | use the hardware tier when the codec is supported |
+| `fastDecode` | `false` | allow non-spec-compliant **software** decode speedups (mpv `--vd-lavc-fast`) — steadies cadence on decode-bound 4K, slight quality tradeoff |
 | `liveSync` | `false` | enable live latency-sync via playback-rate (set `true` for live) |
 | `liveSyncTargetLatency` | `0.6` | target latency (s) the player converges toward |
 | `liveSyncPlaybackRate` | `1.05` | max catch-up rate (sub-audible pitch; *not* mpegts's 1.2) |
@@ -218,12 +219,35 @@ the full build details, and [`tests/README.md`](./tests/README.md) for the node 
 - `Events` — `ERROR`, `MEDIA_INFO`, `STATISTICS_INFO`, `LOADING_COMPLETE`, `RECOVERED_EARLY_EOF`,
   `DESTROYING`, plus ferrite extensions (`TIME_UPDATE`, `LOG`, `DEINT_FAILED`)
 - `ErrorTypes` / `ErrorDetails` / `LoaderErrors` — verbatim mpegts.js strings
-- `FerritePlayer` — `attachCanvas`, `load`, `play`, `pause`, `seek`, `unload`, `detachMediaElement`,
-  `destroy`, `recover`, `on`/`off`, plus ferrite extensions `setDeint(mode)` (0 off / 1 auto / 3 bwdif,
-  software tier) and `setDrc(mode)` (audio dynamics: 0 line / 1 RF / 2 night); props `paused`,
-  `currentTime`, `duration`, `volume`, `muted`, `tier`, `videoWidth`/`videoHeight`, `mediaInfo`,
-  `statisticsInfo`
+- `FerritePlayer` — `attachCanvas`, `attachAudio`, `load`, `play`, `pause`, `seek`, `unload`,
+  `detachMediaElement`, `destroy`, `recover`, `on`/`off`, plus ferrite extensions `setDeint(mode)`
+  (0 off / 1 auto / 3 bwdif, software tier) and `setDrc(mode)` (audio dynamics: 0 line / 1 RF / 2 night);
+  props `paused`, `currentTime`, `duration`, `volume`, `muted`, `tier`, `videoWidth`/`videoHeight`,
+  `mediaInfo`, `statisticsInfo`
+- `initHostAudio() → AudioContext | null`, `hostAudioCtx() → AudioContext | null` — optional shared,
+  gesture-unlocked, app-lifetime AudioContext for embedders (see "Audio on iOS" below)
 - `ferrite.js/controls` — `attachControls(player, target, options?) → { destroy() }`
+
+### Audio on iOS (optional `attachAudio`)
+
+Audio playout runs off the main thread in an AudioWorklet, and the standalone player owns its own
+AudioContext — audio starts on the first user gesture and recovers by itself after interruptions (a
+call, Siri, an output-route change), so **no setup is required** for the common case.
+
+If your app mounts several players (e.g. a channel zapper) or wants audio to survive across player
+teardown, create **one** shared, gesture-unlocked context at app start and inject it:
+
+```ts
+import Ferrite, { initHostAudio } from 'ferrite.js';
+
+const audioCtx = initHostAudio();          // once, at load — armed to unlock on the first tap
+// ...for each player:
+player.attachAudio(audioCtx);              // before play(); the player never creates/closes it
+```
+
+Without `attachAudio()`, the player owns a per-stream context itself (resumed on `play()`, closed on
+teardown). The host-owned context is app-lifetime and the player only attaches its per-stream nodes to
+it.
 
 ## License
 

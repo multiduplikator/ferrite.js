@@ -120,6 +120,13 @@ if [ ! -f "$INSTALL/lib/libavcodec.a" ]; then
     `# extract_extradata: the ONLY bsf ferrite.c instantiates (streaming param-set pull, av_bsf_get_by_name).` \
     `# hevc_metadata/h264_metadata were enabled speculatively and are never referenced — dropped (pure size win).` \
     --enable-bsf=extract_extradata \
+    `# iso_writer (internal CONFIG_EXTRA symbol; not CLI-settable, only SELECTED by a muxer): compiles` \
+    `# libavformat's avc.o/hevc.o box-writers. ferrite.c reuses ff_isom_write_{hvcc,avcc} to build the` \
+    `# WebCodecs config record (hvcC/avcC) from live Annex-B — the SAME functions the mov muxer uses, no` \
+    `# hand-rolled NAL parsing. (Per-AU reframing uses ff_nal_parse_units_buf from base nal.o.) flv is the` \
+    `# LEANEST selector (flv_muxer_select="aac_adtstoasc_bsf iso_writer"); the muxer .o itself is dead-code-` \
+    `# eliminated from the wasm (ferrite.c never calls it), so only the box-writers land → proportional size.` \
+    --enable-muxer=flv \
     --enable-filter=bwdif --enable-filter=format --enable-filter=aresample
   emmake make -j"$JOBS"
   emmake make install
@@ -155,13 +162,19 @@ emcc "$BUILD/ferrite.o" \
   `# on each grow — callers MUST read Module.HEAPU8 FRESH per access (never cache the view across an` \
   `# allocating call). ferrite-bindings.ts re-reads on every access (see its notes).` \
   `# MAXIMUM_MEMORY is mandatory with -pthread (the WebAssembly.Memory is created shared+maximum).` \
-  `# 2 GiB ceiling, GROWABLE from 256 MiB. We briefly ran 4 GiB to prove the old "2 GiB wall" was a JS` \
-  `# SIGN bug (a >2 GiB pointer returns signed-negative → new Uint16Array(buffer, negOffset) throws), not a` \
-  `# wasm32 limit — V8 (Chrome M83, 2020) made wasm heap access unsigned. The fix that MATTERS is reading` \
-  `# engine POINTERS as UNSIGNED (ptr >>> 0) in ferrite-bindings.ts, kept permanently. But measured peak is` \
-  `# only ~1.1 GiB, so 2 GiB is ample — and for SHARED memory the MAXIMUM is reserved as virtual address` \
-  `# space up front, so a needless 4 GiB ceiling only RAISES the risk iOS/Safari refuses to instantiate.` \
-  -sINITIAL_MEMORY=268435456 -sMAXIMUM_MEMORY=2147483648 -sALLOW_MEMORY_GROWTH=1 \
+  `# INITIAL_MEMORY here is only the engine's import MINIMUM (a small 16 MiB floor ≈ static data + the main` \
+  `# stack — the proven minimum). The HOST (ferrite-bindings.ts loadFerrite) PROVIDES the real per-load` \
+  `# WebAssembly.Memory above this floor: a 256 MiB warm initial (the decode realm starts warm for 4K/HEVC)` \
+  `# and a 1.5 GiB maximum. GROWABLE from the host initial up to that 1.5 GiB ceiling. We briefly ran 4 GiB` \
+  `# to prove the old "2 GiB wall" was a JS SIGN bug (a >2 GiB pointer returns signed-negative →` \
+  `# new Uint16Array(buffer, negOffset) throws), not a wasm32 limit — V8 (Chrome M83, 2020) made wasm heap` \
+  `# access unsigned. The fix that MATTERS is reading engine POINTERS as UNSIGNED (ptr >>> 0) in` \
+  `# ferrite-bindings.ts, kept permanently. Measured peak is only ~1.1 GiB (geometry-bound 4K/HEVC, reached` \
+  `# at init, no creep), so 1.5 GiB is ample — and for SHARED memory the MAXIMUM is reserved as virtual` \
+  `# address space up front, so trimming the ceiling 2.0→1.5 GiB lowers the risk iOS/Safari refuses to` \
+  `# instantiate on a memory-constrained iPad/iPhone (the EngineInitFailed failure mode). The engine MAXIMUM` \
+  `# stays 2 GiB so the host's 1.5 GiB descriptor is a valid subset (host max ≤ engine max).` \
+  -sINITIAL_MEMORY=16777216 -sMAXIMUM_MEMORY=2147483648 -sALLOW_MEMORY_GROWTH=1 \
   -sMODULARIZE -sEXPORT_ES6 -sENVIRONMENT=node,worker \
   `# --- ASYNCIFY: single-forward-connection VOD range transport. ---` \
   `# The VOD demuxer fetches container bytes through a custom AVIO read callback (ferrite_io_read_range)` \

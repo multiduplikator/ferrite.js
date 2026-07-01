@@ -80,7 +80,8 @@ genv() {
 echo "matrix (11 clips × 35s)…"
 # --- TS (broadcast / live path): hev1 HEVC, interlaced, mpeg2, the 4K cases ---
 genv cap_ts_hevc2160_10hlg_eac3.ts 3840x2160 50 128 0 "$X265H" eac3 "-f mpegts" & # 1  hev1 4K · 10-bit HLG · EAC3 5.1 downmix
-genv cap_ts_h264_1080i_ac3.ts    1920x1080 25 64  1 "$X264I" ac3  "-f mpegts" &   # 2  1080i deint + AC3
+genv cap_ts_h264_1080i_ac3.ts    1920x1080 25 64  1 "$X264I" ac3  "-f mpegts" &   # 2  1080i deint + AC3 (→ software)
+genv cap_ts_h264_1080p_aac.ts    1920x1080 50 64  0 "$X264"  aac  "-f mpegts -profile:v high -level 4.1" & # 2b progressive H.264 + AAC → WebCodecs (the WC-vs-software isolation pair)
 genv cap_ts_mpeg2_1080i_mp2.ts   1920x1080 25 64  1 "$MP2I"  mp2  "-f mpegts" &   # 3  MPEG-2 1080i + MP2
 genv cap_ts_h264_2160_noaudio.ts 3840x2160 50 128 0 "$X264"  none "-f mpegts" &   # 4  4K H264 WC, video-only
 wait

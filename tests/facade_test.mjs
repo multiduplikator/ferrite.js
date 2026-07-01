@@ -25,8 +25,8 @@ import {
   h264SpsFromAu, avc1CodecString, hevcCodecString, videoCodecInfo, webCodecsEligible,
 } from '../src/worker/codec.ts';
 import {
-  adaptiveLowWater, adaptiveReadAhead, liveSyncRate, liveSyncTarget, reconnectDelayMs,
-  LOW_WATER_DEFAULT_FLOOR, LOW_WATER_DEFAULT_CEILING, LIVE_SYNC_STALL_RELAX_SECS,
+  adaptiveLowWater, adaptiveReadAhead, reconnectDelayMs,
+  LOW_WATER_DEFAULT_FLOOR, LOW_WATER_DEFAULT_CEILING,
   RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS,
   wcRingCapForPlatform, WC_RING_CAP_DEFAULT, WC_RING_CAP_IOS,
 } from '../src/policy.ts';
@@ -64,18 +64,11 @@ function classify({ type, details, info }) {
 
 // ---- 2. config ----------------------------------------------------------------------------
 const def = mergeConfig();
-eq(def.liveSyncPlaybackRate, 1.05, 'default rate is the ferrite 1.05 (not mpegts 1.2)');
-eq(def.liveSyncTargetLatency, 0.6, 'default target is the ferrite 0.6 (not mpegts 0.8)');
-eq(def.liveBufferLatencyChasing, false, 'liveBufferLatencyChasing declared OFF (we use liveSync, not the chaser)');
 eq(def.stashAdaptive, true, 'stashAdaptive on (adaptive low-water)');
 eq(def.threads, 'auto', "default threads 'auto' (host-adaptive; resolved at the DOM boundary)");
-const ov = mergeConfig({ threads: 16, liveSync: true, isLive: true });
+const ov = mergeConfig({ threads: 16, isLive: true });
 eq(ov.threads, 16, 'override threads');
-eq(ov.liveSync, true, 'override liveSync');
-eq(ov.liveSyncPlaybackRate, 1.05, 'override keeps untouched defaults');
 throws(() => mergeConfig({ threads: 0 }), 'threads < 1 rejected');
-throws(() => mergeConfig({ liveSyncMaxLatency: 0.5, liveSyncTargetLatency: 0.6 }), 'maxLatency ≤ target rejected');
-throws(() => mergeConfig({ liveSyncPlaybackRate: 0.9 }), 'rate < 1.0 rejected');
 throws(() => mergeConfig({ stashInitialSize: 9_000_000, stashMaxSize: 2_000_000 }), 'floor > ceiling rejected');
 throws(() => validateConfig({ ...defaultConfig, wasmBaseUrl: '' }), 'empty wasmBaseUrl rejected');
 // stashInitialSize undefined is allowed (engine default)
@@ -229,39 +222,6 @@ for (const lw of [F, 364 * KiB, 1024 * KiB, C]) {
 }
 eq(adaptiveReadAhead(C, RA_C), RA_C, 'low-water read-ahead at ceiling = 2× low-water ceiling');
 
-// --- live latency-sync ---
-const T = 0.6, MAXT = 1.2, MAXR = 1.05, DB = 0.05, GATE = 0.5, K = 0.75;
-const FWD = GATE + 5; // comfortable forward buffer so the gate isn't the binding constraint
-const lsr = (lat, fwd = FWD, fu = false, target = T) => liveSyncRate(lat, target, fwd, fu, MAXR, DB, GATE, K);
-// Dead-band holds unity at/just-above target; just past it nudges; below target never slows down.
-eq(lsr(T), 1.0, 'live-sync at target → unity');
-eq(lsr(T + DB - 0.01), 1.0, 'live-sync within dead-band → unity');
-ok(lsr(T + DB + 0.05) > 1.0, 'live-sync just past dead-band → speed up');
-eq(lsr(T - 1.0), 1.0, 'live-sync below target (at/under live edge) → unity, never slows');
-// Forward-buffer gate: latency high but thin buffer → no nudge (never drain into an underrun).
-eq(lsr(T + 3.0, GATE), 1.0, 'live-sync gate: buffer at gate → unity');
-eq(lsr(T + 3.0, GATE - 0.01), 1.0, 'live-sync gate: buffer under gate → unity');
-ok(lsr(T + 3.0, GATE + 0.01) > 1.0, 'live-sync gate: buffer over gate → speed up');
-// Clamp to the ceiling; every reachable rate in [1, ceiling].
-approx(lsr(T + 100.0), MAXR, 1e-9, 'live-sync huge latency saturates to the ceiling');
-for (let d = 0; d < 400; d++) { const r = lsr(T + d * 0.02); ok(r >= 1.0 && r <= MAXR + 1e-9, `live-sync rate ${r} in [1, ceiling]`); }
-// Monotonic non-decreasing in latency.
-let prevR = 0;
-for (let d = 0; d <= 5.0; d += 0.02) { const r = lsr(T + d); ok(r >= prevR - 1e-9, 'live-sync rate monotonic in latency'); prevR = r; }
-// Force-unity + non-finite → exactly 1.0.
-eq(lsr(T + 5.0, FWD, true), 1.0, 'live-sync force-unity → 1.0');
-eq(lsr(Number.NaN), 1.0, 'live-sync NaN latency → 1.0');
-eq(lsr(Number.POSITIVE_INFINITY), 1.0, 'live-sync Infinity latency → 1.0');
-// Target relaxes with stalls, capped at liveSyncMaxLatency.
-eq(liveSyncTarget(0, T, MAXT), T, 'live-sync target(0) = base');
-ok(liveSyncTarget(1, T, MAXT) > liveSyncTarget(0, T, MAXT), 'live-sync a stall raises the target');
-approx(liveSyncTarget(1, T, MAXT), T + LIVE_SYNC_STALL_RELAX_SECS, 1e-9, 'live-sync target(1) = base + relax');
-eq(liveSyncTarget(2, T, MAXT), MAXT, 'live-sync target caps at liveSyncMaxLatency'); // 0.6 + 0.6 = 1.2
-eq(liveSyncTarget(1000, T, MAXT), MAXT, 'live-sync target stays capped for a large count');
-// A relaxed target chases LESS (or equal) for the same latency.
-ok(lsr(0.72, FWD, false, liveSyncTarget(1, T, MAXT)) < lsr(0.72, FWD, false, liveSyncTarget(0, T, MAXT)),
-  'live-sync relaxed target reduces speed-up');
-
 // --- reconnect backoff (policy.ts reconnectDelayMs) ---
 eq(reconnectDelayMs(0, RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS), 1000, 'reconnect attempt 0 → base 1000ms');
 eq(reconnectDelayMs(1, RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS), 2000, 'reconnect attempt 1 → 2000ms (exp)');
@@ -270,9 +230,8 @@ eq(reconnectDelayMs(3, RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS), 8000, 'recon
 eq(reconnectDelayMs(10, RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS), 8000, 'reconnect large attempt → capped at max');
 eq(reconnectDelayMs(-1, RECONNECT_DELAY_MS, RECONNECT_MAX_DELAY_MS), 1000, 'reconnect negative attempt → base (guarded)');
 
-// Config wiring spot-check: the low-water / latency-sync knobs the worker/clock read have the ferrite defaults.
+// Config wiring spot-check: the low-water knobs the worker/clock read have the ferrite defaults.
 eq(defaultConfig.stashMaxSize, C, 'config stashMaxSize default = low-water ceiling');
-eq(defaultConfig.liveSyncPlaybackRate, MAXR, 'config rate default = 1.05');
 
 // ---- 7. platform detection (iOS/iPadOS/Apple-WebKit, conservative) ---------------------
 // UA strings cover: iPhone Safari, iPhone Chrome (CriOS), iPad legacy UA, iPadOS-13+ desktop UA,

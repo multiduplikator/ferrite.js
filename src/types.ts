@@ -181,6 +181,7 @@ export interface FerriteStats {
   cadenceDrawRate: number;       // effective DRAW target (fps) = content rate ÷ tier (≈25 at tier 2)
   cadenceDegradeReason: number;  // 0 = none; 1 = an auto ladder rung engaged; 2 = manual present-cap override
   cadenceRung: number;           // graduated auto-degrade rung: 0 none · 1 skip-non-ref · 2 +skip-loop · 3 +present-cap
+  cadenceDropToKey: number;      // Fix-B rung-4 fires this load (Live drop-to-keyframe); 0 on a healthy stream
   // ---- decode-relief LEVERS (the combinatorial perf/quality trade) — the player's resolved
   //      lever state so perf (benchlog) + smoothness (buildlog) records line up unambiguously by combo. ----
   levers: {
@@ -218,12 +219,24 @@ export interface FerriteStats {
   audioUnderruns: number; // cumulative audio playout underruns (scheduled audio fell behind → the clock stutters)
   audioGapSecs: number;   // cumulative inserted silence (s) across those underruns — the audible playout gap
   audioDrops: number;     // cumulative audio chunks dropped at the reservoir cap (the reservoir bound)
-  speed: number; // current live-sync playback rate (1.0 = no sync nudge)
-  liveSyncStalls: number; // audio underruns counted (relaxes the latency target)
+  videoRingDrops: number; // cumulative video AUs the demux dropped (consumer fell behind — decode-bound signal)
+  audioRingDrops: number; // cumulative audio AUs the demux dropped (PR_DROPS on the audio packet ring)
+  avDiffMs: number;       // A/V lip-sync error (ms): heard-audio media-PTS − displayed video time (~0 = in sync)
+  buffering: number;      // 1 while the audio output is rebuffering (mpv cache-pause: the present clock is frozen)
+  speed: number; // playback rate, pinned 1.0 (mpv does not chase live latency by rate — a faithful no-op constant)
   // ---- recovery counters (the single error controller's recovery path; un-stubbed from the bus) ----
   reconnects: number;     // cumulative LIVE reconnect attempts (network-drop/upstream-silence → reopen)
   stalls: number;         // cumulative ingest stall-watchdog firings (adaptive upstream-silence mean+2σ)
   latencyToLive: number;  // current latency-to-live proxy (s) — the scheduled-ahead audio reservoir
+  audioScheduledAhead: number; // reservoir depth (s): how far ahead of ctx time audio is scheduled
+  // ---- audio-path overlay telemetry (a.buf / a.sync rows) ----
+  audioSrcChannels: number; // decoded SOURCE channels pre-downmix (6 for EAC3 5.1; 0 before first audio)
+  audioOutChannels: number; // output channels after the engine downmix (always 2 / stereo)
+  audioStreamRate: number;  // decoded source sample rate (Hz)
+  audioCtxRate: number;     // the AudioContext sample rate (Hz) the stream is resampled to (0 before audio)
+  audioGainDb: number;      // applied loudness makeup gain (dB; 0 = unity / unseeded)
+  audioLoudnessDb: number;  // measured RMS-dBFS loudness proxy (≥0 = unseeded / silent)
+  targetLatency: number;    // steady-state live audio-buffer target (s) the reservoir converges toward
   // ---- AUTHORITATIVE teardown counters ----
   // The leak gate asserts "every resource → 0 on destroy" from REAL state, not a harness assumption. TWO
   // provenances (FIX2): workers/audioContexts are read LIVE from main's own resource handles (→ 0 the
@@ -235,6 +248,10 @@ export interface FerriteStats {
   audioContexts: number;   // live AudioContext instances (the master clock): 1 active, 0 after teardown
   connections: number;     // open upstream/Range connections (decode worker's final stats): 0 after abort
   openVideoFrames: number; // un-closed WebCodecs VideoFrames pinning the HW pool (0 on the software tier)
+  // Controller playback-state name — a STABLE string a host maps to its own UI status without polling events.
+  // (Kept as an inline union so this portable types file stays free of internal-module imports; the values
+  // are the controller's PlaybackStateName, with the internal 'eof' surfaced as the stable host string 'ended'.)
+  state: 'idle' | 'opening' | 'buffering' | 'playing' | 'paused' | 'reconnecting' | 'ended' | 'closing' | 'closed';
 }
 
 // --- a tiny AVCodecID → name map (host ignores; display only) ---------------------

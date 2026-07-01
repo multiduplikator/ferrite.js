@@ -19,8 +19,10 @@ import {
   cadenceStats, cadenceSelfCheck, median, nextHold, isStaleLoadGen, CADENCE_WINDOW_MS, DEFAULT_CONTENT_FPS,
   capAdvance, CADENCE_TIER_FULL, CADENCE_TIER_HALF, DEGRADE_REASON_NONE,
   DEGRADE_REASON_UNDER_DELIVERY, DEGRADE_REASON_MANUAL, DEGRADE_RING_TREND_MS,
-  ladderStep, demuxRingPressure,
-  RUNG_NONE, RUNG_L2, RUNG_L2_L3, RUNG_L2_L3_L1,
+  ladderStep, demuxRingPressure, rungDecimation,
+  RUNG_NONE, RUNG_L2, RUNG_L2_L1, RUNG_L2_L1_L3, LADDER_L1_MIN_FPS,
+  shouldLateDrop, shouldAheadHold, preAudioClockAdvance, isClockDiscontinuity, pllCorrectionPerTick,
+  rung4Severe, RUNG4_SUSTAIN_MS, RUNG4_REARM_MS, RUNG4_SEVERE_FRAC,
   type CadenceSample, type LadderState,
 } from './present-cadence';
 import { VsyncEstimator } from './vsync-estimator';
@@ -38,22 +40,6 @@ const post = (m: PresentToMain, transfer: Transferable[] = []): void => g.postMe
 // is a failover/splice seam → re-anchor the clock instead of waiting/dumping.
 const SEAM_BACK_US = 500_000;   // PTS backward jump > 0.5s ⇒ discontinuity
 const SEAM_FWD_US = 3_000_000;  // PTS forward jump  > 3s   ⇒ discontinuity
-const NO_AUDIO_GRACE_TICKS = 60; // ~1s holding the first frame for audio before video-only free-run
-// SYNC GUARD (VLC-style hard-resync, dec.c ±3× band analogue): once the Bresenham cadence is driving
-// presentation, the audio master no longer picks frames — so a slow drift between the cadence and the
-// audio clock can accumulate. If the front frame falls more than this BEHIND media_now (the cadence has
-// desynced LATE from audio), skip the ring forward to the frame nearest media_now and re-anchor the
-// cadence. 120 ms ≈ 6 frames @ 50fps — far above normal ±½-vsync cadence jitter, so on a clean clip it
-// never fires (no thrash); it only bounds a genuine A/V divergence (full audio-bending is deferred).
-const SYNC_GUARD_US = 120_000;
-// SYNC-GUARD HYSTERESIS (the thrash fix). A throughput-limited client (decode < content rate) leaves the
-// front STEADILY behind the audio clock — without hysteresis the guard hard-resyncs every tick (~35×/s),
-// dropping frames it shouldn't and making throughput WORSE in a feedback loop. So the behind-resync now
-// fires ONLY for a GENUINE discontinuity: the desync must be (a) SUSTAINED for several ticks (not a single-
-// tick excursion), (b) outside a post-resync COOLDOWN, and (c) NOT during measured under-delivery (that is
-// throughput-behind → handled by the graceful-degradation tier + drop-oldest, NEVER by churning the guard).
-const SYNC_SUSTAIN_TICKS = 4;   // the front must be > guard behind for this many consecutive ticks before a resync
-const SYNC_COOLDOWN_MS = 1000;  // after a hard-resync, suppress further resyncs for ≥1 s (VLC resyncs rarely, not 35×/s)
 // LADDER: the GRADUATED, AXIS-SEPARATED degrade ladder REPLACES the atomic present-cap+skip-non-ref+skip-loop
 // latch. The present-cap and the decode skips are independent axes: the
 // ladder climbs rung0→1(skip-non-ref)→2(+skip-loop)→3(+present-cap) one step per settle window while a PRESENT-SIDE detector reads the
@@ -68,16 +54,14 @@ const AUTO_DEGRADE: boolean = true;
 const TIME_POST_MS = 120;       // throttle the currentTime → main posts
 const PSTATS_POST_MS = 250;     // pstats post cadence — each post now reports the TRUE trailing-1s cadence
                                 // window (CADENCE_WINDOW_MS), so the ~1Hz bus always reads a full-1s metric.
-
-/** Lock the media clock to the audio epoch on the FIRST audible sample, preserving continuity (port of
- *  caps.rs::audio_lock_clock). If the video-only wall fallback already ran the clock PAST the audio
- *  epoch (late audio), keep it and re-base the anchor so the audio elapsed continues forward — no
- *  ~1s backward snap; otherwise snap forward to the audio epoch with the anchor unchanged. */
-function audioLockClock(mediaUs: number, ptsAnchorUs: number, rawUs: number): [number, number] {
-  const target = ptsAnchorUs + rawUs;
-  if (mediaUs > target) return [mediaUs, mediaUs - rawUs]; // late audio → continuity re-base
-  return [target, ptsAnchorUs];                            // normal start → snap forward
-}
+// Clock-lock tuning (mpv adjust_sync / last_seek_pts). The audio master clock C_ACLOCK is now the ABSOLUTE
+// media PTS (worklet-written), so the present clock locks to it directly + slews via the CLAMPED adjust_sync
+// PLL (pllCorrectionPerTick, player_core::cadence). The near/far gain consts live there.
+const CLOCK_DISC_SNAP_US = 5_000_000;        // LIVE-only: residual >5s = a discontinuity (loop/splice) → snap, don't
+                                             // slew (mpv reset_playback_state threshold; the clamped PLL absorbs sub-5s steps)
+const SEEK_LOCK_WINDOW_US = 5_000_000;       // VOD seek-hold: a post-seek C_ACLOCK within this of the target releases the hold
+const SEEK_HOLD_MAX_TICKS = 240;             // ~4s @60fps backstop: release the seek-hold even if no anchor lands
+const DISC_FLUSH_KEEP_US = 3_000_000;        // after a disc-snap, evict ring frames more than this from the snapped clock
 
 // A ring frame — a tagged union so BOTH decode tiers share the ring/eviction/seam/clock. Only the
 // per-frame payload + how it is RELEASED differ: a software 'yuv' frame names a HELD decoder frame
@@ -129,6 +113,15 @@ class Presenter {
   private engineMemory: WebAssembly.Memory | null = null;
   private rafId = 0;
   private paused = false;
+  private buffering = false; // mpv cache-pause: freeze the clock (hold the frame) while the audio output rebuffers
+  private isLive = false;    // set per-load via the reset msg — gates the discontinuity machinery (clock-disc-snap,
+                             // the SEAM re-anchor, the vod_audio_stall hold). VOD has none of it (monotonic timeline).
+  private discFlushPending = false; // a live disc-snap just reset the clock → tick() evicts stale old-origin ring frames
+  // VOD seek-hold (mpv last_seek_pts): park the clock at the seek target until a genuine post-seek audio anchor
+  // lands, so present never locks onto the transient/stale C_ACLOCK during the cross-worker audio re-anchor.
+  private seekHold = false;
+  private seekTargetUs = 0;
+  private seekHoldTicks = 0;
   private gen = 0;                 // current load gen (filters a stale dropVideoFrames)
   private destroyed = false;
 
@@ -139,8 +132,7 @@ class Presenter {
   private mediaAnchorPtsUs = 0;    // pts_anchor_us — first presented frame's PTS (relative epoch)
   private mediaUs = 0;             // smoothed media clock (µs): rAF-advanced, PLL-locked to the audio sample
   private audioLocked = false;     // the media clock has been INITIALISED from the audio epoch
-  private audioDriving = false;    // this tick the media clock came from the AUDIO master (not wall/grace)
-  private graceTicks = 0;          // ticks holding the first frame for audio (startup/resume)
+  private audioDriving = false;    // this tick the media clock came from the AUDIO master (not wall/frame-pace)
 
   // ---- mpv-style DISPLAY CADENCE (Bresenham num_vsyncs; replaces "retire all frames whose ptsUs ≤ now"
   //      once the display refresh is measured-stable) — the 50-on-75 anti-judder core (mpv video.c:835-843).
@@ -153,9 +145,7 @@ class Presenter {
   private cadenceErrorMs = 0;           // sigma-delta fractional-vsync accumulator (mpv display_sync_error)
   private holdRemaining = 0;            // vsyncs left to hold the current front before advancing
   private cadenceHolds: number[] = [];  // recent hold counts (telemetry: the 1,2 pattern); cap 64
-  private syncResyncs = 0;              // cumulative SYNC GUARD hard-resyncs (cadence desynced from audio)
-  private syncBehindTicks = 0;          // consecutive ticks the front has been > SYNC_GUARD_US behind audio (hysteresis)
-  private lastResyncTs = 0;             // wall ts (ms) of the last hard-resync (cooldown anchor; 0 = none yet)
+  private syncResyncs = 0;              // cumulative VO late-drop re-seeds (the front fell behind the audio clock)
   private vsTick = { intervalMs: 0, adopted: false, hz: 0, jitter: 0 }; // vsync snapshot cached once/tick
   // ---- graceful-degradation LADDER (graduated, axis-separated — replaces the atomic present-cap+skip-non-ref+skip-loop latch) -------
   // A PRESENT-SIDE decode-bound detector climbs a rung ∈ {0,1,2,3} (0 none · 1 skip-non-ref · 2 +skip-loop · 3 +present-cap)
@@ -179,7 +169,6 @@ class Presenter {
   private decodeContentPeriodUs = 0;
   private degradeSkips = 0;             // cumulative frames INTENTIONALLY skipped (decimated) by the degraded tier
   private ringLowWater = Infinity;      // min ring.length observed since the last pstats post (draining signal)
-  private underDelivering = false;      // live (per-post) under-delivery signal — also suppresses the behind-resync
   private lastPushPtsUs = -1;           // last decoded-frame PTS pushed (content-period estimator, decimation-independent)
   // The DEMUX-RING latency signal the auto-degrade trigger runs on (the real "decode behind
   // ingest → audio starves" signal, routed from the decode worker on each frame). `demuxRingBytes` is the
@@ -189,6 +178,19 @@ class Presenter {
   private demuxRingBytes = 0;
   private demuxRingTrend: { at: number; bytes: number }[] = [];
   private autoSkipsEngaged = false;
+  // ---- Fix-B rung-4: Live drop-to-keyframe (SOFTWARE tier only) ----
+  // `pushes` = cumulative DECODE-INTAKE frames (each pushYuv/pushVf), uncapped by the present-cap — over a
+  // window it gives the TRUE decode-delivery rate even when audio holds the clock at realtime (the judder
+  // case). `lastFrameWasSw` tracks the current tier (software frame ⇒ true, WC frame ⇒ false) — rung-4 is
+  // SOFTWARE-only (the WC tier is owned by the wc-stall watchdog). The sustain/re-arm/fires state gates the
+  // PresentToDecode 'dropToKeyframe' fire to a sustained-severe deficit, thrash-damped by a min re-arm.
+  private pushes = 0;            // cumulative decode-intake frames (the decode-delivery rate baseline)
+  private wPushes = 0;           // `pushes` at the last pstats post (the per-window decodeFps delta baseline)
+  private hasLiveEdge = false;   // realtime-rigid timeline (set per-load via the reset msg) — rung-4 is live-only
+  private lastFrameWasSw = false; // current tier (set per intake: software frame ⇒ true, WC frame ⇒ false)
+  private rung4SustainMs = 0;    // continuous severe-deficit time at RUNG_MAX (resets on any non-severe window)
+  private rung4LastFireTs = 0;   // ts of the last drop-to-keyframe fire (arms the re-arm interval); 0 = none
+  private rung4Fires = 0;        // drop-to-keyframe fires this load (monotonic telemetry → cadenceDropToKey)
 
   private vfW = 0;                 // last announced WebCodecs frame dims (the demuxer reports WC dims as 0)
   private vfH = 0;
@@ -294,6 +296,7 @@ class Presenter {
   private pushYuv(m: Extract<DecodeToPresent, { type: 'frame' }>): void {
     if (m.contentPeriodUs > 0) this.decodeContentPeriodUs = m.contentPeriodUs; // TRUE (non-ref-skip-independent) period for the cap
     this.demuxRingBytes = m.demuxRingBytes; // the demux-ring latency signal the degrade trigger runs on
+    this.pushes++; this.lastFrameWasSw = true; // software tier (gates the Fix-B rung-4 drop-to-keyframe)
     this.feedContentPeriod(m.ptsUs);
     const frame: RingFrame = { kind: 'yuv', ptsUs: m.ptsUs, w: m.w, h: m.h, cw: m.cw, ch: m.ch, bitDepth: m.bitDepth, colorspace: m.colorspace, colorRange: m.colorRange, colorTrc: m.colorTrc, sarNum: m.sarNum, sarDen: m.sarDen, token: m.token, ptrs: m.ptrs, lns: m.lns };
     if (this.ring.length < this.swRingCap) {
@@ -315,6 +318,7 @@ class Presenter {
   private pushVf(m: Extract<DecodeToPresent, { type: 'vframe' }>): void {
     if (m.contentPeriodUs > 0) this.decodeContentPeriodUs = m.contentPeriodUs; // TRUE (non-ref-skip-independent) period for the cap
     this.demuxRingBytes = m.demuxRingBytes; // the demux-ring latency signal the degrade trigger runs on
+    this.pushes++; this.lastFrameWasSw = false; // WebCodecs (HW) tier — rung-4 is owned by the wc-stall watchdog
     this.feedContentPeriod(m.ptsUs);
     const frame: RingFrame = { kind: 'vf', ptsUs: m.ptsUs, frame: m.frame, sarNum: m.sarNum, sarDen: m.sarDen };
     if (this.ring.length < this.wcRingCap) {
@@ -358,33 +362,92 @@ class Presenter {
    *  because A_ACLOCK is sampled jittery on main and read at rAF here). */
   private mediaUsNow(dt: number): number {
     this.audioDriving = false; // recomputed below; the SYNC GUARD only re-syncs to a live AUDIO master
+    // mpv cache-pause: while the audio output is rebuffering (MAIN set RW_PLAYING=0 → the worklet released
+    // C_AUDIO=0), FREEZE the clock at its current position (hold the frame) instead of free-running on the
+    // wall clock via the no-audio branch below. Distinct from `paused` (user intent): freeze on EITHER.
+    if (this.buffering) return this.mediaUs;
+    // VOD seek hold (mpv last_seek_pts): keep the clock parked at the target — showing the post-seek keyframe
+    // video — until C_ACLOCK reflects a genuine post-seek audio anchor (near the target). Ignores the
+    // transient/stale C_ACLOCK the audio producer briefly publishes during the cross-worker re-anchor. A
+    // backstop tick cap releases the hold even if no anchor lands (failed seek), so it can't freeze forever.
+    if (this.seekHold) {
+      this.seekHoldTicks++;
+      const rawUs = Atomics.load(this.clock, C_ACLOCK) * 1000;
+      const hasAudioNow = Atomics.load(this.clock, C_AUDIO) > 0;
+      const postSeekAnchor = hasAudioNow && rawUs > 0 && Math.abs(rawUs - this.seekTargetUs) < SEEK_LOCK_WINDOW_US;
+      if (postSeekAnchor || this.seekHoldTicks > SEEK_HOLD_MAX_TICKS) {
+        this.seekHold = false;
+        this.audioLocked = false; // re-lock to the now-valid audio clock on the fall-through below
+        // Drop mediaUs to the real clock so the fall-through max() locks to reality, not the held target —
+        // matters on a FAILED seek (audio sits unchanged; else the held-high target forces a backward slew).
+        if (rawUs > 0) this.mediaUs = rawUs;
+      } else {
+        this.mediaUs = this.seekTargetUs; // hold at target; show the post-seek keyframe frames
+        return this.seekTargetUs;
+      }
+    }
     const hasAudio = Atomics.load(this.clock, C_AUDIO) > 0;
-    if (hasAudio) {
-      this.graceTicks = 0; // audio present → never declare video-only
-      const rawUs = Atomics.load(this.clock, C_ACLOCK) * 1000; // ms → µs
-      if (rawUs <= 0) { this.mediaUs = 0; return this.mediaAnchorPtsUs; } // audio not audible yet → HOLD on the anchor
-      this.audioDriving = true; // a live, audible audio master clock is driving media_now
-      const target = this.mediaAnchorPtsUs + rawUs;
+    const rawUs = hasAudio ? Atomics.load(this.clock, C_ACLOCK) * 1000 : 0; // ms → µs
+    // VIDEO leads at startup, audio JOINS aligned, exactly like mpv (handle_playback_restart: the first video
+    // frame establishes the clock; the AO joins). Ferrite can't delay the autonomous AudioWorklet the way mpv
+    // delays its AO, so the symmetry is built on the PRESENT side: video free-runs from frame 1 (NO hold), and
+    // the first audio lock is a BOUNDED, NEVER-FORWARD-SKIP, disc-snap-immune settle that converges the startup
+    // A/V offset via the PLL. Snapping media_us to the audio epoch would drop every already-buffered video frame
+    // → a frozen frame with running audio at startup (worst on HEVC where HW decode latency lets audio lead).
+    if (hasAudio && rawUs > 0) {
+      // --- audio is AUDIBLE: it drives / joins the master clock ---
+      this.audioDriving = true;
+      // C_ACLOCK is the ABSOLUTE played-audio PTS (base + edgePts − buffered) on the SAME timeline as the video
+      // frame PTS — use it DIRECTLY (adding the video anchor double-counts the origin → a fixed ~first-PTS A/V
+      // offset; absolute video frames already line up at av≈0).
+      const target = rawUs;
       if (!this.audioLocked) {
-        const [m, a] = audioLockClock(this.mediaUs, this.mediaAnchorPtsUs, rawUs);
-        this.mediaUs = m; this.mediaAnchorPtsUs = a; this.audioLocked = true;
+        // JOIN. With the mpv audio_start_ao gate on MAIN, audio output is released only once the video clock has
+        // reached the audio first-sample PTS, so the clock is already aligned here — keep media_us where video
+        // put it (NEVER jump). Only seed from the audio epoch if video produced nothing (audio-only / audio-first).
+        if (this.mediaUs <= 0) this.mediaUs = target;
+        this.audioLocked = true;
       } else if (!this.paused) {
         this.mediaUs += dt * 1000;                          // smooth rAF advance (dt ms → µs)
         this.clockResidualUs = target - this.mediaUs;       // instrument: the PLL error BEFORE the correction
-        this.mediaUs += this.clockResidualUs * 0.10;        // lock to the audio sample (PLL)
+        if (isClockDiscontinuity(this.isLive, this.clockResidualUs, CLOCK_DISC_SNAP_US)) {
+          // DISCONTINUITY (loop / reconnect / ad splice) — LIVE ONLY. The audio clock RESET to the new content's
+          // PTS, a large step → SNAP, don't slew (slewing strands the clock for seconds → freeze then rush). On
+          // VOD the timeline is monotonic + contiguous, so a >5s residual is a transient excursion, not a
+          // discontinuity — snapping there desyncs + floods credits; VOD always slews via the PLL.
+          this.mediaUs = target;
+          this.lastDrawnPts = -1; // force a fresh front draw at the new origin
+          this.cadenceErrorMs = 0;
+          this.holdRemaining = 0;
+          this.discFlushPending = true; // tick() drops the stale pre-seam frames from the ring
+        } else {
+          // mpv adjust_sync: nudge the clock toward the audio position by a correction CLAMPED to a fraction of
+          // one content frame period (±frame·{0.1,0.4}), prorated to this rAF tick's share of a frame. The
+          // audio_start_ao gate keeps the JOIN aligned, so the steady-state residual is small jitter the
+          // near-gain de-jitters; a genuine sub-5s step (e.g. a 4s splice) slews over many frames, exactly mpv.
+          const framePeriodUs = this.decodeContentPeriodUs > 0 ? this.decodeContentPeriodUs : this.contentDurMs() * 1000;
+          this.mediaUs += pllCorrectionPerTick(this.clockResidualUs, framePeriodUs, dt * 1000);
+        }
       }
       return this.mediaUs;
     }
-    if (this.graceTicks > NO_AUDIO_GRACE_TICKS) {
-      // Grace elapsed with no audio → genuinely video-only: advance by a PAUSE-AWARE dt accumulate.
-      if (this.mediaUs <= 0) this.mediaUs = this.mediaAnchorPtsUs;
-      else if (!this.paused) this.mediaUs += dt * 1000;
-      return this.mediaUs;
+    // --- no AUDIBLE audio yet: the clock is FRAME-PACED, not a wall free-run (mpv restart alignment) ---
+    // mpv never advances the master on a wall clock independent of frames. A wall free-run would race media_us
+    // ahead of slow-arriving frames → audio released (the audio_start_ao gate, current_ms>=apts) over a still-
+    // BLACK canvas. Instead: wall-pace but CLAMP to the newest decoded frame (preAudioClockAdvance) so the clock
+    // can't sail past real frames — yet it KEEPS advancing (never a hard freeze, which would deadlock the
+    // audio_start_ao gate: the front must retire so current_ms climbs to apts). Three cases, one path: (1) audio
+    // present but not yet heard at startup; (2) a genuinely video-only stream; (3) audio dropped MID-STREAM —
+    // live chases the edge (clamped), VOD HOLDS (rebuffer catches it).
+    this.audioDriving = false;
+    const vodAudioStall = !this.isLive && this.audioLocked;
+    if (this.mediaUs <= 0) {
+      this.mediaUs = this.mediaAnchorPtsUs; // seed on the first video frame's PTS
+    } else if (!this.paused && !vodAudioStall) {
+      const newest = this.ring.length ? this.ring[this.ring.length - 1].ptsUs : this.mediaUs;
+      this.mediaUs = preAudioClockAdvance(this.mediaUs, dt, newest);
     }
-    // Within the grace: HOLD on the anchor waiting for the audio clock to start.
-    if (!this.paused) this.graceTicks++;
-    this.mediaUs = 0;
-    return this.mediaAnchorPtsUs;
+    return this.mediaUs;
   }
 
   // ---- present loop ----------------------------------------------------------
@@ -395,7 +458,7 @@ class Presenter {
     const dt = this.lastTs === 0 ? 0 : ts - this.lastTs;
     this.lastTs = ts;
     this.vsync.push(dt); // feed the display-refresh estimator (it guards dt≤0 / pause-gap internally)
-    this.ringLowWater = Math.min(this.ringLowWater, this.ring.length); // present-ring draining signal (feeds underDelivering / sync-guard suppression)
+    this.ringLowWater = Math.min(this.ringLowWater, this.ring.length); // present-ring draining signal (feeds the degrade ladder's ring-low gate)
     if (this.ring.length === 0) return;
 
     // Anchor the media clock to the FIRST frame's PTS (relative epoch — TS PTS clocks start non-zero).
@@ -426,13 +489,29 @@ class Presenter {
     if (!cadenceMode) this.cadenceActive = false;
 
     const released: number[] = [];
-    // SEAM detection (BOTH modes): a PTS discontinuity between adjacent ring frames is a failover/splice
+    // A live disc-snap (mediaUsNow) just reset the clock to the new content's origin → evict any ring frame
+    // still on the OLD origin (far from `now`); otherwise the present HOLDs on a stale far-future frame (the
+    // freeze the real-fixture loop showed). Keep frames near the new origin (already-decoded new content) so
+    // the recovery is a brief gap, not a re-decode stall.
+    if (this.discFlushPending) {
+      this.discFlushPending = false;
+      while (this.ring.length && Math.abs(this.ring[0].ptsUs - now) > DISC_FLUSH_KEEP_US) {
+        this.dropped++;
+        this.releaseFrame(this.ring.shift()!, released);
+      }
+      this.lastDrawnPts = -1;
+      if (this.ring.length === 0) { this.postReleases(released); return; }
+    }
+    // SEAM detection (LIVE ONLY): a PTS discontinuity between adjacent ring frames is a failover/splice
     // → re-anchor the clock epoch onto the new timeline (instead of flushing it as "ancient"). In legacy
     // mode this loop ALSO retires every frame whose ptsUs ≤ now (the old behaviour); in cadence mode it
     // only handles seams and the Bresenham step below drives retirement (so we never advance >1 frame/tick).
     while (this.ring.length >= 2) {
       const gap = this.ring[1].ptsUs - this.ring[0].ptsUs;
-      if (gap > SEAM_FWD_US || gap < -SEAM_BACK_US) {
+      // LIVE ONLY: a large ring PTS gap on live = a loop/splice/reconnect boundary the clock must jump to.
+      // VOD is monotonic + contiguous (a seek resets the ring epoch separately), so a gap there is not a
+      // discontinuity to re-anchor on — overriding the audio clock with the ring PTS would desync.
+      if (this.isLive && (gap > SEAM_FWD_US || gap < -SEAM_BACK_US)) {
         const newPts = this.ring[1].ptsUs;
         if (Atomics.load(this.clock, C_AUDIO) > 0) {
           // Anchor the new video PTS to the (continuous) audio elapsed: media_now re-derives to newPts.
@@ -520,7 +599,7 @@ class Presenter {
    *  longer picks frames per rAF; the measured display cadence does. A VLC-style SYNC GUARD first bounds
    *  any slow A/V divergence (the audio master is still the rate reference for re-sync). */
   private runCadence(now: number, ts: number, released: number[]): void {
-    if (this.paused) { this.syncBehindTicks = 0; return; } // frozen front — no advance, no countdown, no desync
+    if (this.paused || this.buffering) return; // frozen front (user pause OR rebuffer) — no advance/countdown
 
     // Transition legacy→cadence (vsync just adopted). The current front was already on-screen for an
     // unknown number of legacy ticks, so DON'T seed it a full fresh hold (that would add its legacy age +
@@ -533,55 +612,45 @@ class Presenter {
       if (this.lastDrawnPts >= 0) { this.holdRemaining = 1; return; }
     }
 
-    // SYNC GUARD (VLC-style, both directions): once the cadence drives frames, drift from the audio master
-    // can build. Bound |front.ptsUs − media_now| to SYNC_GUARD_US. Gated on a live audio master + an
-    // already-drawn front, so it can't thrash when we're merely a fraction of a vsync off.
+    // AXIS 1 — mpv VO late-drop (render_frame). When an audio master is live, DROP front frames whose display
+    // window has passed the master clock so the DISPLAYED video tracks the audio clock — keeping the audio clock
+    // authoritative (mpv's "drop video, never freeze the clock"). mpv's ONLY two guards (faithful): don't drop
+    // when paused, and the "rather degrade to ~10 fps than freeze forever" floor — never let > PRESENT_FLOOR_MS
+    // pass without an actual present (above it, SHOW the late frame). NO sustain/cooldown/under-delivery
+    // suppression: the DECODE-LOAD relief is Axis 2 (the degrade ladder), so Axis 1 is free to hold sync
+    // per-frame without self-inflicted churn (shouldLateDrop, player_core::cadence).
     if (this.audioDriving && this.lastDrawnPts >= 0) {
-      const drift = this.ring[0].ptsUs - now; // <0 ⇒ front behind audio (late); >0 ⇒ ahead (early)
-      if (drift < -SYNC_GUARD_US) {
-        // BEHIND. HYSTERESIS (the thrash fix): a throughput-limited client sits PERMANENTLY behind, so a
-        // per-tick resync churns (35×/s) and makes throughput worse. Only hard-resync on a GENUINE
-        // discontinuity: the desync must be SUSTAINED (≥ SYNC_SUSTAIN_TICKS), OUTSIDE the post-resync
-        // cooldown, and NOT during measured under-delivery (that is throughput-behind → owned by the
-        // graceful-degradation tier + drop-oldest, never by the guard). Otherwise we let the cadence
-        // present the queued frames in order (accept a little latency) — drop-oldest bounds memory.
-        this.syncBehindTicks++;
-        const cooling = this.lastResyncTs > 0 && (ts - this.lastResyncTs) < SYNC_COOLDOWN_MS;
-        const genuine = this.syncBehindTicks >= SYNC_SUSTAIN_TICKS && !cooling && !this.underDelivering;
-        if (genuine && this.ring.length >= 2) {
-          // Skip the ring forward to the frame nearest now (a hard-resync), releasing the skipped slots as
-          // drops. Only when a nearer frame exists (best>0) — else there's nothing to skip to.
-          let best = 0, bestDist = Math.abs(this.ring[0].ptsUs - now);
-          for (let i = 1; i < this.ring.length; i++) {
-            const d = Math.abs(this.ring[i].ptsUs - now);
-            if (d < bestDist) { bestDist = d; best = i; }
-          }
-          if (best > 0) {
-            for (let i = 0; i < best; i++) {
-              const f = this.ring[i];
-              if (f.ptsUs !== this.lastDrawnPts) this.dropped++; // skipped-without-display ⇒ a real drop
-              this.releaseFrame(f, released);
-            }
-            this.ring.splice(0, best);
-            this.lastDrawnPts = -1;   // force a redraw of the resynced front
-            this.cadenceErrorMs = 0;  // re-anchor the accumulator onto the new phase
-            this.holdRemaining = 0;
-            this.syncResyncs++;       // telemetry: a hard-resync fired (should be ~0 on a clean/steady clip)
-            this.lastResyncTs = ts;   // arm the cooldown
-            this.syncBehindTicks = 0; // re-arm the sustain counter
-          }
-        }
-      } else {
-        this.syncBehindTicks = 0; // recovered (or within band) → re-arm the sustain requirement
-        if (drift > SYNC_GUARD_US) {
-          // AHEAD: the cadence outran the audio clock (e.g. an audio flat-spot / underrun froze media_now).
-          // We CAN'T skip backward (older frames are already released), so HOLD the current front this tick —
-          // don't advance — until media_now catches up. Bounds A/V drift on the early side without thrash.
-          return;
-        }
+      const framePeriodUs = this.contentDurMs() * 1000;
+      // wall ms since the last ACTUAL present (lastDrawAt is stamped only on a new-frame draw) = mpv's
+      // `now - prev_vsync`. Constant across the drop loop below (dropping never draws), so the floor forces
+      // exactly one present per PRESENT_FLOOR_MS.
+      const msSincePresent = this.lastDrawAt > 0 ? ts - this.lastDrawAt : 0;
+      let droppedAny = false;
+      while (shouldLateDrop(now - this.ring[0].ptsUs, framePeriodUs, msSincePresent, this.paused, this.ring.length)) {
+        const old = this.ring.shift()!; // shouldLateDrop guards ring.length >= 2
+        if (old.ptsUs !== this.lastDrawnPts) this.dropped++;
+        this.releaseFrame(old, released);
+        droppedAny = true;
       }
-    } else {
-      this.syncBehindTicks = 0; // no live audio master to measure against → no desync accrual
+      if (droppedAny) {
+        // The new front is the frame nearest the clock — re-seed the Bresenham cadence onto it.
+        this.lastDrawnPts = -1;
+        this.cadenceErrorMs = 0;
+        this.holdRemaining = 0;
+        this.syncResyncs++;
+      }
+      // AHEAD: the front runs ahead of the audio master → HOLD this tick (repeat the current front) so
+      // media_us catches up, converging the offset to < 1 vsync instead of latching at the old 120 ms
+      // ahead-guard. mpv display-sync tolerance (>= 20 ms AND >= 1 vsync); bounded by PRESENT_FLOOR_MS like
+      // the behind-side late-drop so a large VOD residual can't freeze the frame. (shouldAheadHold =
+      // the mirror of shouldLateDrop.)
+      if (shouldAheadHold(
+        this.ring[0].ptsUs - now, // frontAheadUs (>0 ⇒ the front is ahead of the clock)
+        this.vsTick.intervalMs * 1000,
+        msSincePresent,
+        this.paused,
+        this.ring.length,
+      )) return;
     }
 
     // Bresenham advance: first draw seeds; otherwise count down one vsync and advance when it expires.
@@ -702,8 +771,14 @@ class Presenter {
     while (this.cadence.length && this.cadence[0].at < cutoff) this.cadence.shift();
     // (The content-period estimator is fed from DECODE ARRIVALS, not drawn frames — see feedContentPeriod —
     //  so the degraded tier's decimation can't corrupt it.)
-    // Throttled currentTime → main (drives facade currentTime + TIME_UPDATE).
-    if (ts - this.lastTimePost >= TIME_POST_MS) { this.lastTimePost = ts; post({ type: 'time', ms: f.ptsUs / 1000 }); }
+    // Throttled currentTime → main, carrying the SAME-INSTANT A/V difference (master clock − this just-drawn
+    // frame's PTS). Both reads are live here (lastNowUs = this tick's clock, f.ptsUs = the frame we just drew),
+    // so MAIN gets a consistent lip-sync reading instead of subtracting a stale current_ms from a fresh audio
+    // clock (mpv update_av_diff: a_pos − video_pts, one call).
+    if (ts - this.lastTimePost >= TIME_POST_MS) {
+      this.lastTimePost = ts;
+      post({ type: 'time', ms: f.ptsUs / 1000, avDiffMs: (this.lastNowUs - f.ptsUs) / 1000 });
+    }
     if (ts - this.lastPstatsPost >= PSTATS_POST_MS) {
       this.lastPstatsPost = ts;
       // DIAGNOSTIC per-tick present view (→ /pumplog): is media_now inside the ring's PTS span [front,back]?
@@ -758,12 +833,12 @@ class Presenter {
           }
         }
       }
-      // GRACEFUL-DEGRADATION LADDER (graduated, axis-separated; PURE decision in ladderStep). A PRESENT-SIDE
-      // decode-bound detector climbs one rung per settle window (rung0→1 skip-non-ref →2 +skip-loop →3 +present-cap, rung2→3 gated on
-      // contentFps ≥ LADDER_L1_MIN_FPS) and de-escalates in strict reverse (present-cap→skip-loop→skip-non-ref) on sustained headroom.
-      // A capable stream keeps up (present at the effective target, media/wall ≥1.0, ring drained) → stays at
-      // rung0; a present-side stall (ring pinned full) can never trip it. `underDelivering` is the LIVE
-      // present-side signal that suppresses the sync-guard behind-resync (throughput-behind ≠ a discontinuity).
+      // GRACEFUL-DEGRADATION LADDER (graduated, axis-separated; PURE decision in ladderStep). Axis-2 of the
+      // two-axis decode-bound handling: rung-1 (skip-non-ref) IS mpv check_framedrop, gated on the INSTANTANEOUS
+      // forward headroom at the ring BACK (unmasked by the Axis-1 VO late-drop); the heavier rungs (+present-cap
+      // HALVE for fast content / +skip-deblock) climb on a SUSTAINED throughput deficit and de-escalate in strict
+      // reverse on sustained headroom. A capable stream stays at rung0; a present-side stall (ring pinned full)
+      // can never trip it.
       const contentRate = contentPeriodMs > 0 ? 1000 / contentPeriodMs : 0;
       // Present-ring watermarks (this post window): LOW = draining (decode can't keep the ring full); HEALTHY
       // = stayed comfortably full (room to give a lever back); FULL = pinned at ~cap (a present-side stall).
@@ -772,15 +847,7 @@ class Presenter {
       const lowRing = this.ringLowWater <= Math.max(3, ringCap >> 2);
       const ringHealthy = this.ringLowWater >= Math.max(4, ringCap >> 1);
       const presentRingFull = this.ringLowWater >= ringCap - 1;
-      // `underDelivering` = present below 85 % of the ACTIVE tier's target (content rate ÷ active tier) while
-      // the present ring drains — the live throughput-behind signal that also suppresses the sync-guard
-      // behind-resync. The tier-adjusted target means a HEALTHY degraded stream (25 fps at the halved tier)
-      // does NOT read as under-delivering (else it would wrongly suppress the guard / re-flag forever).
       const activeTier = this.activeTier();
-      const effectiveTarget = activeTier > 0 ? contentRate / activeTier : contentRate;
-      this.underDelivering =
-        this.cadenceActive && !this.paused && haveContentPeriod &&
-        effectiveTarget > 0 && m.fps > 0 && m.fps < effectiveTarget * 0.85 && lowRing;
       if (AUTO_DEGRADE && dWall > 0) {
         // Maintain the demux-ring TREND (one sample per post) → its window MIN is the growth-delta baseline.
         // On the ladder the demux ring is only a WEAK HINT (the present-side detector owns decode-bound), so
@@ -791,37 +858,81 @@ class Presenter {
         let demuxRingMin = this.demuxRingBytes;
         for (const s of this.demuxRingTrend) if (s.bytes < demuxRingMin) demuxRingMin = s.bytes;
         const demuxPressure = demuxRingPressure(this.demuxRingBytes, demuxRingMin);
+        // decodeFps = TRUE decode-DELIVERY rate (distinct intake frames / wall) — UNCAPPED by the present-cap,
+        // so it exposes a decode deficit even when audio holds the clock at realtime (the judder case).
+        const decodeFps = (this.pushes - this.wPushes) * 1000 / dWall;
+        // The present-cap tier that WOULD apply one rung down (so the ladder can gate un-halving on real
+        // capacity). Content-aware: halve only at rung ≥ 2 for fast content (mirrors the lever map below).
+        const l1Ok = contentRate >= LADDER_L1_MIN_FPS;
+        const decimLower = rungDecimation(this.degradeRung - 1, contentRate);
         const prevRung = this.degradeRung;
         const prevTier = this.cadenceTier;
+        // Axis-2 rung-1 (mpv check_framedrop) signal: how far the NEWEST decoded frame (the ring BACK) is AHEAD
+        // of the master clock. Measured at the back, NOT the displayed front, so the Axis-1 late-drop (which
+        // keeps the front near the clock) can't mask a genuine decoder deficit. Empty ring ⇒ 0 (decoder not
+        // ahead → eligible to engage; the cadenceActive/content gates suppress startup/seek).
+        const framePeriodUs = contentPeriodMs * 1000;
+        const forwardHeadroomUs = this.ring.length ? this.ring[this.ring.length - 1].ptsUs - this.lastNowUs : 0;
         const next: LadderState = ladderStep(
           { rung: this.degradeRung, climbMs: this.ladderClimbMs, dropMs: this.ladderDropMs },
           {
             cadenceActive: this.cadenceActive, paused: this.paused, haveContentPeriod,
             presentFps: m.fps, contentFps: contentRate,
-            // decimation = the ACTIVE display tier (manual present-cap OR the rung's present-cap) so a manually-halved
-            // display isn't read as a permanent decode deficit; at rung 3 this equals the rung's present-cap anyway.
+            // decimation = the ACTIVE display tier (manual present-cap OR the rung's present-cap) so a manually-
+            // halved display isn't read as a permanent decode deficit; at rung 3 this equals the rung's cap anyway.
             decimation: activeTier > 0 ? activeTier : 1,
+            decodeFps, decimLower,
             clockRateRatio,
-            ringLow: lowRing, ringHealthy, presentRingFull, demuxPressure, dWallMs: dWall,
+            ringLow: lowRing, ringHealthy, presentRingFull, demuxPressure,
+            forwardHeadroomUs, framePeriodUs, dWallMs: dWall,
           },
         );
         this.degradeRung = next.rung; this.ladderClimbMs = next.climbMs; this.ladderDropMs = next.dropMs;
-        // DERIVE the present-cap tier from the rung: tier 2 (halve the display) only at the top rung.
-        this.cadenceTier = this.degradeRung >= RUNG_L2_L3_L1 ? CADENCE_TIER_HALF : CADENCE_TIER_FULL;
+        // QUALITY-FIRST, content-aware lever map (mirrors the rung doc in present-cadence.ts):
+        //   fast content (≥48 fps): r1=skip-non-ref, r2=+present-cap HALVE (quality-neutral), r3=+skip-deblock
+        //   slow content (<48 fps): r1=skip-non-ref, r2=+skip-deblock (halve unwatchable; capped at r2 by the gate)
+        const half = l1Ok && this.degradeRung >= RUNG_L2_L1;
+        const skipNonref = this.degradeRung >= RUNG_L2;
+        const skipLoop = l1Ok ? this.degradeRung >= RUNG_L2_L1_L3 : this.degradeRung >= RUNG_L2_L1;
+        this.cadenceTier = half ? CADENCE_TIER_HALF : CADENCE_TIER_FULL;
         if (this.degradeRung !== prevRung) {
-          // Rung changed → FAN OUT the new skip state to the decode worker (skipNonref at rung ≥ 1, skipLoop
-          // at rung ≥ 2; the decode worker OR-folds with the manual skips → manual precedence). One message
-          // carries both fields, so a climb AND a de-escalation update them in the right order automatically.
+          // Rung changed → FAN OUT the new skip state to the decode worker (the decode worker OR-folds with the
+          // manual skips → manual precedence). One message carries both fields, so a climb AND a de-escalation
+          // update them in the right order automatically.
           this.autoSkipsEngaged = this.degradeRung > RUNG_NONE;
-          this.port.postMessage({
-            type: 'autoSkips',
-            skipNonref: this.degradeRung >= RUNG_L2,
-            skipLoop: this.degradeRung >= RUNG_L2_L3,
-          });
-          // Re-seed the Bresenham accumulator ONLY when the present-cap tier actually flipped — a clean
-          // phase at the new displayed period (no carried error). Skip-only rung changes leave the display
-          // cadence untouched, so they need no re-seed.
+          this.port.postMessage({ type: 'autoSkips', skipNonref, skipLoop });
+          // Re-seed the Bresenham accumulator ONLY when the present-cap tier actually flipped — a clean phase at
+          // the new displayed period. Skip-only rung changes leave the display cadence untouched.
           if (this.cadenceTier !== prevTier) { this.cadenceErrorMs = 0; this.holdRemaining = 0; }
+        }
+
+        // ---- Fix-B rung-4: Live drop-to-keyframe (SOFTWARE tier only) ----
+        // The ladder has maxed out (all safe levers on) and the SOFTWARE decoder is STILL severely below
+        // the content rate (decodeFps < contentFps × RUNG4_SEVERE_FRAC). The safe levers can't close the
+        // gap, so the demux/present would otherwise shed frames blind → corrupt mid-GOP. Instead tell the
+        // decode worker to skip deltas to the next IDR + flush (GOP-clean drops). The decode worker owns
+        // the action + latch (it sees isKey + owns vdecFlush) and SELF-GATES on SW + live edge; here we
+        // gate on the present-visible signals: LIVE + audio-master (the realtime pressure that climbs the
+        // rung to MAX) + the SOFTWARE tier + a sustained-severe deficit, thrash-damped by a min re-arm
+        // interval so it can't fire every GOP. VOD never reaches RUNG_MAX under no-pressure slow-mo, and
+        // backpressures anyway; the WC tier is owned by the wc-stall watchdog (a rung-4 here would disarm it).
+        const hasAudioMaster = Atomics.load(this.clock, C_AUDIO) > 0;
+        const rung4Armed = this.hasLiveEdge
+          && hasAudioMaster
+          && this.lastFrameWasSw
+          && rung4Severe(this.degradeRung, decodeFps, contentRate);
+        if (rung4Armed) {
+          this.rung4SustainMs += dWall;
+          const rearmed = this.rung4LastFireTs <= 0 || (ts - this.rung4LastFireTs) >= RUNG4_REARM_MS;
+          if (this.rung4SustainMs >= RUNG4_SUSTAIN_MS && rearmed) {
+            this.rung4LastFireTs = ts;
+            this.rung4SustainMs = 0; // fresh sustain window after a fire
+            this.rung4Fires++;
+            if (DEBUG) post({ type: 'plog', m: `[degrade] rung-4 drop-to-keyframe fire #${this.rung4Fires} (decodeFps=${decodeFps.toFixed(0)} < ${contentRate.toFixed(0)}×${RUNG4_SEVERE_FRAC})` });
+            this.port.postMessage({ type: 'dropToKeyframe' });
+          }
+        } else {
+          this.rung4SustainMs = 0; // any non-severe window breaks the continuous streak
         }
       }
       // Degrade REASON (telemetry): the manual present-cap override wins (it forces the cap regardless of the
@@ -848,6 +959,7 @@ class Presenter {
       // Re-anchor the window for the next post (rates are per-window deltas; clock-broke clears here).
       this.wTs = ts; this.wRaf = this.rafTicks; this.wDropped = this.dropped; this.wNowUs = this.lastNowUs; this.wClockBroke = false;
       this.wSyncResyncs = this.syncResyncs;
+      this.wPushes = this.pushes; // Fix-B rung-4: re-anchor the decode-delivery (decodeFps) window baseline
       // DIAGNOSTIC: the present-cadence + clock telemetry bundle (feeds getStats() / the debug overlay).
       // Observe-only — the auto-degrade ladder above owns the playback decisions; this is pure readout.
       if (DEBUG) post({
@@ -859,6 +971,7 @@ class Presenter {
         cadenceHoldMean, cadenceHold2Frac, cadenceErrorMs: r2(Math.abs(this.cadenceErrorMs)), syncResyncsPerSec,
         cadenceTier: effectiveTier, cadenceDrawRate, cadenceDegradeReason: this.cadenceDegradeReason,
         cadenceRung: this.degradeRung, // the graduated auto-degrade rung (0 none·1 skip-non-ref·2 +skip-loop·3 +present-cap)
+        cadenceDropToKey: this.rung4Fires, // Fix-B rung-4 fires this load (Live drop-to-keyframe); 0 on a healthy stream
       });
     }
   }
@@ -866,6 +979,11 @@ class Presenter {
   // ---- control (from main) ---------------------------------------------------
 
   setPaused(paused: boolean): void { this.paused = paused; }
+
+  /** mpv cache-pause freeze (the audio output starved/refilled — DISTINCT from a user pause). While set, the
+   *  clock holds at its current position (mediaUsNow short-circuit) so playback rebuffers from here instead
+   *  of free-running. MAIN owns RW_PLAYING; this only holds the present clock + frame. */
+  setBuffering(buffering: boolean): void { this.buffering = buffering; }
 
   /** Lever 1 MANUAL override: force the tier-2 present-rate cap ON/OFF independent of
    *  the auto-degrade trigger. A toggle change flips the ACTIVE tier, so re-seed the Bresenham accumulator
@@ -880,8 +998,10 @@ class Presenter {
 
   /** Flush the ring (release software slots / close VideoFrames) + re-arm the present clock so the
    *  next frame re-anchors a fresh timeline. Sent on (re)load / unload / seek / live-resume. */
-  reset(gen: number): void {
+  reset(gen: number, hasLiveEdge: boolean, isLive: boolean, seekTargetMs: number): void {
     this.gen = gen;
+    this.hasLiveEdge = hasLiveEdge; // Fix-B rung-4 is live-only — set per-load from the source capabilities
+    this.isLive = isLive;           // gates the clock-disc-snap / SEAM re-anchor / vod_audio_stall machinery
     if (this.ring.length) {
       const released: number[] = [];
       for (const f of this.ring) this.releaseFrame(f, released);
@@ -894,7 +1014,17 @@ class Presenter {
     this.mediaAnchorPtsUs = 0;
     this.mediaUs = 0;
     this.audioLocked = false;
-    this.graceTicks = 0;
+    this.discFlushPending = false;
+    // VOD seek (mpv last_seek_pts): seekTargetMs ≥ 0 → hold the clock at the target until a genuine post-seek
+    // audio anchor lands (mediaUsNow's seek-hold). Otherwise (a (re)load / live-resume) no hold.
+    if (seekTargetMs >= 0) {
+      this.seekHold = true;
+      this.seekTargetUs = seekTargetMs * 1000;
+      this.mediaUs = this.seekTargetUs; // report/hold the target until post-seek content arrives
+      this.seekHoldTicks = 0;
+    } else {
+      this.seekHold = false;
+    }
     this.vfW = 0; this.vfH = 0;
     // Cadence: a (re)load/seek/live-resume starts a fresh measurement → clear the rolling buffer +
     // PTS-delta window and drop the prior-draw stamp so the cross-reset wall gap is NOT counted as a
@@ -915,10 +1045,7 @@ class Presenter {
     this.holdRemaining = 0;
     this.cadenceHolds = [];
     this.audioDriving = false;
-    // SYNC-GUARD hysteresis: a fresh timeline → re-arm the sustain counter + cooldown (no stale desync /
-    // cooldown leaking across the re-anchor; the first post-reset behind-excursion must re-qualify).
-    this.syncBehindTicks = 0;
-    this.lastResyncTs = 0;
+    this.buffering = false; // a fresh timeline clears any rebuffer-freeze (MAIN re-establishes it if still starved)
     // GRACEFUL-DEGRADATION: a (re)load/seek/live-resume is a fresh decision point → RE-ARM the ladder to
     // rung 0 and let it re-detect (so a degraded rung never strands onto a healthy new clip, and the "never
     // degrade a healthy stream" invariant holds per-timeline). Within a CONTINUOUS stream (across seams,
@@ -929,7 +1056,6 @@ class Presenter {
     this.cadenceTier = CADENCE_TIER_FULL;
     this.cadenceDegradeReason = DEGRADE_REASON_NONE;
     this.ringLowWater = Infinity;
-    this.underDelivering = false;
     // Re-arm the demux-ring trigger for the fresh timeline AND retract the auto-engaged decode
     // skips on the decode worker (if we had fanned them out) so a degraded tier never strands onto a
     // healthy new clip. The decode worker ALSO self-clears its auto skips on a fresh load (run()); this
@@ -941,6 +1067,13 @@ class Presenter {
       this.autoSkipsEngaged = false;
       this.port.postMessage({ type: 'autoSkips', skipNonref: false, skipLoop: false });
     }
+    // Fix-B rung-4 state — fresh per timeline (the fires counter is per-load telemetry; the drop-to-keyframe
+    // latch itself lives in the decode worker, which self-clears it on its own fresh-load/resume paths). The
+    // decodeFps window baseline re-anchors so the cross-reset wall gap can't read as a bogus decode deficit.
+    this.rung4SustainMs = 0;
+    this.rung4LastFireTs = 0;
+    this.rung4Fires = 0;
+    this.wPushes = this.pushes;
     // Clock/draw instrument: re-anchor the post window so the cross-reset wall gap isn't read as a
     // present interval, and invalidate clock-advance for the window spanning the re-anchor.
     this.lastNowUs = 0;
@@ -978,6 +1111,9 @@ self.onmessage = (e: MessageEvent<MainToPresent>): void => {
         post({ type: 'error', message: 'present-init: ' + (err instanceof Error ? err.message : String(err)) });
       }
       break;
+    case 'setBuffering':
+      presenter?.setBuffering(msg.buffering);
+      break;
     case 'setPaused':
       presenter?.setPaused(msg.paused);
       break;
@@ -985,7 +1121,7 @@ self.onmessage = (e: MessageEvent<MainToPresent>): void => {
       presenter?.setManualHalf(msg.present); // Lever 1 manual present=half override
       break;
     case 'reset':
-      presenter?.reset(msg.gen);
+      presenter?.reset(msg.gen, msg.hasLiveEdge, msg.isLive, msg.seekTargetMs);
       break;
     case 'destroy': {
       const framesClosed = presenter?.destroy() ?? 0; // count of VideoFrames it close()d emptying the ring

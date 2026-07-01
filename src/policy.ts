@@ -1,14 +1,16 @@
 // Pure player policy.
 //
 // DOM-free + side-effect-free, so it node-imports (erasable TS) and is unit-tested in
-// facade_test.mjs. Three policies live here:
+// facade_test.mjs. Four policies live here:
 //   adaptive demux-ring low-water + read-ahead   (adaptive_low_water / adaptive_read_ahead)
-//   live latency-sync playback rate + target      (live_sync_rate / live_sync_target)
+//   compressed packet-ring readahead depth        (LIVE/VOD_READAHEAD_MS + the ring SAB/ceiling consts)
+//   iOS-aware WebCodecs present-ring cap          (wc_ring_cap_for_platform)
 //   early-EOF reconnect backoff                   (hls.js FragmentLoadPolicy)
 //
 // The reference consts are inlined as defaults in config.ts (the declared knobs); these fns take the
 // resolved values as PARAMETERS so the Config knobs actually drive them (the reference policy
-// hardcodes consts because its engine has no per-instance config surface).
+// hardcodes consts because its engine has no per-instance config surface). (We do NOT chase live
+// latency by changing playback rate — exactly like mpv; there is no playback-rate-chaser policy.)
 
 // ---------------------------------------------------------------------------
 // adaptive demux-ring low-water.
@@ -65,70 +67,44 @@ export function adaptiveReadAhead(lowWater: number, ceiling: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// live latency-sync.
+// compressed packet-ring readahead depth (mpv demuxer-readahead / streaming cache).
 //
-// The adaptive low-water minimised the STRUCTURAL floor (the demux ring). Live latency-sync chases the
-// VARIABLE latency that accumulates ABOVE it over a long live session — bursty-CDN delivery + post-stall
-// refills push extra already-decoded media into the playout reservoir (audio scheduled ahead of the play
-// cursor), so the playhead drifts behind the live edge. It speeds the master (audio) clock up by a small, bounded factor while
-// the reservoir is above target; BOTH present tiers pace to that same audio master clock, so wiring the
-// rate at the single audio master latency-syncs both tiers with no per-tier code.
+// mpv parks the live-latency resilience in the COMPRESSED demuxer read-ahead, NOT in decoded buffers: the
+// vd/ad decoded async queues are off by default (`use_queue=false`), so the only deep buffer is the
+// demuxer's parsed-packet read-ahead. For a streaming source mpv sets
+// `min_secs = max(1.0, cache-secs=3600s)` bounded by `demuxer-max-bytes = 150 MiB` (mpv demux.c)
+// — i.e. "buffer as many seconds as fit in 150 MiB". The decoded side stays tiny (~0.2 s AO buffer;
+// a 2–3 frame VO window, mpv video.c get_req_frames).
 //
-// Policy mirrors hls.js latency-controller (NOT mpegts.js's discrete 3-state chaser):
-//   * a CONTINUOUS SIGMOID rate curve (gentle near 1.0, saturating at the ceiling),
-//   * a DEAD-BAND around target (no nudge for tiny errors → anti-hunting),
-//   * a forward-buffer GATE (never speed up into an underrun),
-//   * relax-target-on-stall (each stall raises the target → stop chasing into repeated underruns).
-// ferrite owns WebAudio (no free <video>.playbackRate pitch correction) → applied as
-// AudioBufferSourceNode.playbackRate; the ceiling is kept LOW (1.05× ≈ +85 cents, sub-audible).
+// Ferrite's packet rings ARE that parsed-packet read-ahead. A shallow (~1 s) depth would let the audio
+// packet ring empty on any decode/present dip under the player-serve real-time backpressure, satisfying
+// the cache-pause AND-gate (decoded PCM < 0.06 s && packets_empty) → audio freezes. A seconds-deep cushion
+// keeps the ring NON-empty through a dip so the audio decoder rides it and cache-pause never trips. It adds
+// NO heard-audio latency: the cushion sits AHEAD in the demux and is decoded just-in-time — the decoded PCM
+// depth (AUDIO_RING_SECONDS) alone sets latency.
+//
+// FORCED DEVIATION from mpv's single shared 150 MiB pool: the split-realm SPSC SAB design has one ring PER
+// stream (no cross-stream donation across worker realms), and a browser tab's SAB RAM is tighter than a
+// desktop heap. So each pool is bounded independently (video ~4 s/32 MiB, audio ~4 s/512 KiB) rather than
+// sharing 150 MiB. 4 s is deep enough to absorb the dips a 1 s cushion cannot.
+// (iOS memory headroom for the larger video SAB is a separate validation item.)
 // ---------------------------------------------------------------------------
 
-/** Per-stall target relaxation (s): each underrun raises the target so we converge to a SAFER latency
- *  on a jittery source instead of chasing back into the same stall (hls.js liveSyncOnStallIncrease).
- *  the stall-relax constant. */
-export const LIVE_SYNC_STALL_RELAX_SECS = 0.3;
-/** Rate quantisation step (LIVE_SYNC_RATE_QUANTUM = 100 → 0.01 steps). */
-const LIVE_SYNC_RATE_QUANTUM = 100;
-
-/**
- * Target latency relaxed by the observed stall count. Each stall raises the
- * target by [`LIVE_SYNC_STALL_RELAX_SECS`], capped at `maxTarget` (the config `liveSyncMaxLatency`).
- */
-export function liveSyncTarget(stallCount: number, base: number, maxTarget: number): number {
-  return Math.min(base + stallCount * LIVE_SYNC_STALL_RELAX_SECS, maxTarget);
-}
-
-/**
- * The live-sync playback rate for the master clock, in `[1.0, maxRate]`.
- *
- * `latency` = how far behind the live edge we are (master-clock buffer ahead of the play cursor, s).
- * `fwdBuffer` = the COMMITTED forward buffer protecting against underrun (s). `forceUnity` pins the
- * rate to 1.0 for the caller-owned edge cases (seam until re-anchored, pause/resume resync, hidden tab,
- * non-live, startup). Returns exactly 1.0 (never below) → only ever speeds playback up toward the live
- * edge, never slows it down.
- *
- * Anti-hunting: a nudge requires BOTH `latency − target > deadband` AND `fwdBuffer > gate`. The curve is
- * `2 / (1 + e^(−k·distance))` (1.0 at distance 0, → 2 as distance → ∞), quantised + clamped to the
- * ceiling — monotonic non-decreasing in `latency`.
- */
-export function liveSyncRate(
-  latency: number,
-  target: number,
-  fwdBuffer: number,
-  forceUnity: boolean,
-  maxRate: number,
-  deadband: number,
-  gate: number,
-  sigmoidK: number,
-): number {
-  if (forceUnity || !Number.isFinite(latency)) return 1.0;
-  const distance = latency - target;
-  if (distance <= deadband || fwdBuffer <= gate) return 1.0;
-  const max = clamp(maxRate, 1.0, 2.0);
-  const sigmoid = 2.0 / (1.0 + Math.exp(-sigmoidK * distance));
-  const rate = Math.round(sigmoid * LIVE_SYNC_RATE_QUANTUM) / LIVE_SYNC_RATE_QUANTUM;
-  return clamp(rate, 1.0, max);
-}
+/** LIVE packet-ring read-ahead — a seconds-deep cushion (mpv streaming-cache override) so a decode/present
+ *  dip can never empty a ring and trip the audio cache-pause. */
+export const LIVE_READAHEAD_MS = 4000;
+/** VOD packet-ring read-ahead — mpv local-file `demuxer-readahead-secs = 1.0` floor (the VOD path is
+ *  Range-seekable, so it re-pulls rather than starves; kept at the mpv local default for now). */
+export const VOD_READAHEAD_MS = 1000;
+/** Video packet-ring SAB allocation (bytes). Holds a multi-MB 4K-HEVC IDR PES + ~4 s of compressed
+ *  read-ahead; sized above the fill ceiling so the non-blocking route can never overflow the ring. */
+export const VIDEO_RING_SAB_BYTES = 32 * 1024 * 1024;
+/** Video packet-ring fill ceiling — must stay below the SAB (≥ one 4K IDR PES of headroom). */
+export const VIDEO_RING_CEIL_BYTES = 28 * 1024 * 1024;
+/** Audio packet-ring SAB allocation (bytes). Audio AUs are KBs; 512 KiB holds several seconds of EAC3 5.1. */
+export const AUDIO_RING_SAB_BYTES = 512 * 1024;
+/** Audio packet-ring fill ceiling — must stay below the SAB. */
+export const AUDIO_RING_CEIL_BYTES = 448 * 1024;
 
 // ---------------------------------------------------------------------------
 // iOS-aware WebCodecs present-ring cap (in-flight VideoFrame budget).
@@ -181,8 +157,10 @@ export const RECONNECT_MAX_TIMEOUT_RETRY = 4;
 export const RECONNECT_DELAY_MS = 1000;
 /** hls.js maxRetryDelayMs (backoff ceiling). */
 export const RECONNECT_MAX_DELAY_MS = 8000;
-/** Per-attempt CONNECT timeout (ms) → a ConnectingTimeout counted on the timeout budget. */
-export const CONNECT_TIMEOUT_MS = 8000;
+/** Per-attempt CONNECT timeout (ms) → a ConnectingTimeout counted on the timeout budget. 16 s: a portal
+ *  stream (upstream provisioning / MAC rotation) can take 10-15 s to deliver its first byte, and a shorter
+ *  deadline aborts a stream that would have come up. */
+export const CONNECT_TIMEOUT_MS = 16000;
 /** FIX 3 — eof-boundary floor (bytes). A clean live close that delivered at least this much (~one
  *  PES/GOP) is a real connection boundary → seamless 0ms retry. Below it (a trickle-then-close), the
  *  close is treated as `empty-body` → a BUDGETED reconnect, so a degenerate server can't hot-loop. */
